@@ -30,13 +30,15 @@ docker run -v workspace_vol:/build -d --name cp-temp alpine tail -f /dev/null
 # copying CIS binary to local
 docker cp cp-temp:/build/out/$RELEASE_PLATFORM/bin/k8s-bigip-ctlr $WKDIR/
 # copy attributions to local
-docker cp cp-temp:/build/all_attributions.txt $CURDIR/../../k8s-bigip-ctlr
+if [ $LICENSE == 1 ]; then
+  docker cp cp-temp:/build/all_attributions.txt $CURDIR/../../k8s-bigip-ctlr
+fi
 #Removing the temporory container
 docker rm -f cp-temp
 
 cp requirements.txt $WKDIR/
 cp schemas/bigip-virtual-server_v*.json $WKDIR/
-cp schemas/as3-schema-3.20.0-3-cis.json $WKDIR/
+cp schemas/as3-schema-3.25.0-3-cis.json $WKDIR/
 cp LICENSE $WKDIR/
 cp $CURDIR/help.md $WKDIR/help.md
 echo "{\"version\": \"${VERSION_INFO}\", \"build\": \"${BUILD_INFO}\"}" \

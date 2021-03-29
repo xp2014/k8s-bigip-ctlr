@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2017,2018,2019 F5 Networks, Inc.
+ * Copyright (c) 2017-2021 F5 Networks, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -99,12 +99,13 @@ var (
 	buildInfo string
 
 	// Flag sets and supported flags
-	flags        *pflag.FlagSet
-	globalFlags  *pflag.FlagSet
-	bigIPFlags   *pflag.FlagSet
-	kubeFlags    *pflag.FlagSet
-	vxlanFlags   *pflag.FlagSet
-	osRouteFlags *pflag.FlagSet
+	flags         *pflag.FlagSet
+	globalFlags   *pflag.FlagSet
+	bigIPFlags    *pflag.FlagSet
+	kubeFlags     *pflag.FlagSet
+	vxlanFlags    *pflag.FlagSet
+	osRouteFlags  *pflag.FlagSet
+	gtmBigIPFlags *pflag.FlagSet
 
 	// Custom Resource
 	customResourceMode *bool
@@ -142,6 +143,7 @@ var (
 	credsDir                  *string
 	as3Validation             *bool
 	sslInsecure               *bool
+	ipam                      *bool
 	enableTLS                 *string
 	tls13CipherGroupReference *string
 	ciphers                   *string
@@ -151,8 +153,8 @@ var (
 	trustedCertsCfgmap     *string
 	agent                  *string
 	logAS3Response         *bool
+	shareNodes             *bool
 	overriderAS3CfgmapName *string
-	userDefinedAS3Decl     *string
 	filterTenants          *bool
 
 	vxlanMode        string
@@ -166,6 +168,11 @@ var (
 	clientSSL        *string
 	serverSSL        *string
 
+	gtmBigIPURL      *string
+	gtmBigIPUsername *string
+	gtmBigIPPassword *string
+	gtmCredsDir      *string
+
 	// package variables
 	isNodePort         bool
 	watchAllNamespaces bool
@@ -178,12 +185,13 @@ var (
 )
 
 func _init() {
-	flags = pflag.NewFlagSet("main", pflag.ContinueOnError)
-	globalFlags = pflag.NewFlagSet("Global", pflag.ContinueOnError)
-	bigIPFlags = pflag.NewFlagSet("BigIP", pflag.ContinueOnError)
-	kubeFlags = pflag.NewFlagSet("Kubernetes", pflag.ContinueOnError)
-	vxlanFlags = pflag.NewFlagSet("VXLAN", pflag.ContinueOnError)
-	osRouteFlags = pflag.NewFlagSet("OpenShift Routes", pflag.ContinueOnError)
+	flags = pflag.NewFlagSet("main", pflag.PanicOnError)
+	globalFlags = pflag.NewFlagSet("Global", pflag.PanicOnError)
+	bigIPFlags = pflag.NewFlagSet("BigIP", pflag.PanicOnError)
+	kubeFlags = pflag.NewFlagSet("Kubernetes", pflag.PanicOnError)
+	vxlanFlags = pflag.NewFlagSet("VXLAN", pflag.PanicOnError)
+	osRouteFlags = pflag.NewFlagSet("OpenShift Routes", pflag.PanicOnError)
+	gtmBigIPFlags = pflag.NewFlagSet("GTM", pflag.PanicOnError)
 
 	// Flag wrapping
 	var err error
@@ -234,10 +242,14 @@ func _init() {
 		"Optional, when set to false, disables as3 template validation on the controller.")
 	sslInsecure = bigIPFlags.Bool("insecure", false,
 		"Optional, when set to true, enable insecure SSL communication to BIGIP.")
+	ipam = bigIPFlags.Bool("ipam", false,
+		"Optional, when set to true, enable ipam feature for CRD.")
 	as3PostDelay = bigIPFlags.Int("as3-post-delay", 0,
 		"Optional, time (in seconds) that CIS waits to post the available AS3 declaration.")
 	logAS3Response = bigIPFlags.Bool("log-as3-response", false,
 		"Optional, when set to true, add the body of AS3 API response in Controller logs.")
+	shareNodes = bigIPFlags.Bool("share-nodes", false,
+		"Optional, when set to true, node will be shared among partition.")
 	enableTLS = bigIPFlags.String("tls-version", "1.2",
 		"Optional, Configure TLS version to be enabled on BIG-IP. TLS1.3 is only supported in tmos version 14.0+.")
 	tls13CipherGroupReference = bigIPFlags.String("cipher-group", "/Common/f5-default",
@@ -251,10 +263,6 @@ func _init() {
 	overrideAS3UsageStr := "Optional, provide Namespace and Name of that ConfigMap as <namespace>/<configmap-name>." +
 		"The JSON key/values from this ConfigMap will override key/values from internally generated AS3 declaration."
 	overriderAS3CfgmapName = bigIPFlags.String("override-as3-declaration", "", overrideAS3UsageStr)
-	userDefinedCfgMapStr := "Optional, provide Namespace and Name of the User Defined ConfigMap as " +
-		"<namespace>/<configmap-name>. The template in this cfgMap is a JSON string with  JSON key/values" +
-		" will be used as a AS3 declaration in CIS."
-	userDefinedAS3Decl = bigIPFlags.String("userdefined-as3-declaration", "", userDefinedCfgMapStr)
 	filterTenants = kubeFlags.Bool("filter-tenants", false,
 		"Optional, specify whether or not to use tenant filtering API for AS3 declaration")
 	bigIPFlags.Usage = func() {
@@ -355,11 +363,26 @@ func _init() {
 		fmt.Fprintf(os.Stderr, "  Openshift Routes:\n%s\n", osRouteFlags.FlagUsagesWrapped(width))
 	}
 
+	// GTM Big IP flags
+	gtmBigIPURL = gtmBigIPFlags.String("gtm-bigip-url", "",
+		"Optional, URL for the GTM Big-IP")
+	gtmBigIPUsername = gtmBigIPFlags.String("gtm-bigip-username", "",
+		"Optional, user name for the GTM Big-IP user account.")
+	gtmBigIPPassword = gtmBigIPFlags.String("gtm-bigip-password", "",
+		"Optional, password for the GMT Big-IP user account.")
+	gtmCredsDir = gtmBigIPFlags.String("gtm-credentials-directory", "",
+		"Optional, directory that contains the GTM BIG-IP username, password, and/or "+
+			"url files. To be used instead of username, password, and/or url arguments.")
+	gtmBigIPFlags.Usage = func() {
+		fmt.Fprintf(os.Stderr, "  GTM:\n%s\n", gtmBigIPFlags.FlagUsagesWrapped(width))
+	}
+
 	flags.AddFlagSet(globalFlags)
 	flags.AddFlagSet(bigIPFlags)
 	flags.AddFlagSet(kubeFlags)
 	flags.AddFlagSet(vxlanFlags)
 	flags.AddFlagSet(osRouteFlags)
+	flags.AddFlagSet(gtmBigIPFlags)
 
 	flags.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage of %s\n", os.Args[0])
@@ -368,6 +391,7 @@ func _init() {
 		kubeFlags.Usage()
 		vxlanFlags.Usage()
 		osRouteFlags.Usage()
+		gtmBigIPFlags.Usage()
 	}
 }
 
@@ -477,12 +501,6 @@ func verifyArgs() error {
 				"Usage: --override-as3-declaration=<namespace>/<configmap-name>")
 		}
 	}
-	if *userDefinedAS3Decl != "" {
-		if len(strings.Split(*userDefinedAS3Decl, "/")) != 2 {
-			return fmt.Errorf("Invalid value provided for --userdefined-as3-declaration" +
-				"Usage: --userdefined-as3-declaration=<namespace>/<configmap-name>")
-		}
-	}
 	return nil
 }
 
@@ -551,6 +569,61 @@ func getCredentials() error {
 			u.Path)
 	}
 	return nil
+}
+
+func getGTMCredentials() {
+	if len(*gtmCredsDir) > 0 {
+		var usr, pass, gtmBigipURL string
+		if strings.HasSuffix(*gtmCredsDir, "/") {
+			usr = *gtmCredsDir + "username"
+			pass = *gtmCredsDir + "password"
+			gtmBigipURL = *gtmCredsDir + "url"
+		} else {
+			usr = *gtmCredsDir + "/username"
+			pass = *gtmCredsDir + "/password"
+			gtmBigipURL = *gtmCredsDir + "/url"
+		}
+
+		setField := func(field *string, filename, fieldType string) {
+			fileBytes, readErr := ioutil.ReadFile(filename)
+			if readErr != nil {
+				log.Debug(fmt.Sprintf(
+					"No %s in credentials directory, falling back to CLI argument", fieldType))
+				if len(*field) == 0 {
+					log.Errorf(fmt.Sprintf("GTM BIG-IP %s not specified", fieldType))
+				}
+			} else {
+				*field = string(fileBytes)
+			}
+		}
+
+		setField(gtmBigIPUsername, usr, "username")
+		setField(gtmBigIPPassword, pass, "password")
+		setField(gtmBigIPURL, gtmBigipURL, "url")
+	}
+	// Verify URL is valid
+	u, err := url.Parse(*gtmBigIPURL)
+	if nil != err {
+		log.Errorf("Error parsing url: %s", err)
+	}
+
+	if len(u.Scheme) == 0 {
+		*gtmBigIPURL = "https://" + *gtmBigIPURL
+		u, err = url.Parse(*gtmBigIPURL)
+		if nil != err {
+			log.Errorf("Error parsing url: %s", err)
+		}
+	}
+
+	if u.Scheme != "https" {
+		log.Errorf("Invalid GTM BIGIP-URL protocol: '%s' - Must be 'https'",
+			u.Scheme)
+	}
+
+	if len(u.Path) > 0 && u.Path != "/" {
+		log.Errorf("GTM BIGIP-URL path must be empty or '/'; check URL formatting and/or remove %s from path",
+			u.Path)
+	}
 }
 
 func setupNodePolling(
@@ -674,13 +747,21 @@ func initCustomResourceManager(
 		LogResponse:   *logAS3Response,
 	}
 
+	GtmParams := crmanager.GTMParams{
+		GTMBigIpUsername: *gtmBigIPUsername,
+		GTMBigIpPassword: *gtmBigIPPassword,
+		GTMBigIpUrl:      *gtmBigIPURL,
+	}
+
 	agentParams := crmanager.AgentParams{
 		PostParams:     postMgrParams,
+		GTMParams:      GtmParams,
 		Partition:      (*bigIPPartitions)[0],
 		LogLevel:       *logLevel,
 		VerifyInterval: *verifyInterval,
 		VXLANName:      vxlanName,
 		PythonBaseDir:  *pythonBaseDir,
+		UserAgent:      getUserAgentInfo(),
 	}
 	agent := crmanager.NewAgent(agentParams)
 
@@ -688,6 +769,7 @@ func initCustomResourceManager(
 		crmanager.Params{
 			Config:            config,
 			Namespaces:        *namespaces,
+			NamespaceLabel:    *namespaceLabel,
 			Partition:         (*bigIPPartitions)[0],
 			Agent:             agent,
 			ControllerMode:    *poolMemberType,
@@ -696,6 +778,8 @@ func initCustomResourceManager(
 			UseNodeInternal:   *useNodeInternal,
 			NodePollInterval:  *nodePollInterval,
 			NodeLabelSelector: *nodeLabelSelector,
+			IPAM:              *ipam,
+			ShareNodes:        *shareNodes,
 		},
 	)
 
@@ -703,6 +787,11 @@ func initCustomResourceManager(
 }
 
 func main() {
+	defer func() {
+		if r := recover(); r != nil {
+			flags.Usage()
+		}
+	}()
 	err := flags.Parse(os.Args)
 	if nil != err {
 		os.Exit(1)
@@ -762,8 +851,21 @@ func main() {
 		os.Exit(1)
 	}
 
+	kubeClient, err = kubernetes.NewForConfig(config)
+	if err != nil {
+		log.Fatalf("[INIT] error connecting to the client: %v", err)
+		os.Exit(1)
+	}
+
 	if *customResourceMode {
+		getGTMCredentials()
 		crMgr := initCustomResourceManager(config)
+		err = crMgr.Agent.GetBigipAS3Version()
+		if err != nil {
+			log.Errorf("%v", err)
+			crMgr.Stop()
+			os.Exit(1)
+		}
 		sigs := make(chan os.Signal, 1)
 		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 		sig := <-sigs
@@ -820,12 +922,6 @@ func main() {
 
 	agRspChan = make(chan interface{}, 1)
 	var appMgrParms = getAppManagerParams()
-
-	kubeClient, err = kubernetes.NewForConfig(config)
-	if err != nil {
-		log.Fatalf("[INIT] error connecting to the client: %v", err)
-		os.Exit(1)
-	}
 
 	// creates the clientset
 	appMgrParms.KubeClient = kubeClient
@@ -959,15 +1055,16 @@ func getAS3Params() *as3.Params {
 		TLS13CipherGroupReference: *tls13CipherGroupReference,
 		Ciphers:                   *ciphers,
 		OverriderCfgMapName:       *overriderAS3CfgmapName,
-		UserDefinedAS3Decl:        *userDefinedAS3Decl,
 		FilterTenants:             *filterTenants,
 		BIGIPUsername:             *bigIPUsername,
 		BIGIPPassword:             *bigIPPassword,
 		BIGIPURL:                  *bigIPURL,
 		TrustedCerts:              getBIGIPTrustedCerts(),
 		SSLInsecure:               *sslInsecure,
+		IPAM:                      *ipam,
 		AS3PostDelay:              *as3PostDelay,
 		LogResponse:               *logAS3Response,
+		ShareNodes:                *shareNodes,
 		RspChan:                   agRspChan,
 		UserAgent:                 getUserAgentInfo(),
 		ConfigWriter:              getConfigWriter(),
@@ -1056,7 +1153,7 @@ func getProcessAgentLabelFunc() func(map[string]string, string, string) bool {
 			if m["overrideAS3"] == "true" || m["overrideAS3"] == "false" {
 				return funCMapOptions(*overriderAS3CfgmapName)
 			} else if m["as3"] == "true" || m["as3"] == "false" {
-				return funCMapOptions(*userDefinedAS3Decl)
+				return true
 			}
 			return false
 		}

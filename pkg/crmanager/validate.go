@@ -1,5 +1,5 @@
 /*-
-* Copyright (c) 2016-2019, F5 Networks, Inc.
+* Copyright (c) 2016-2021, F5 Networks, Inc.
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -31,7 +31,7 @@ func (crMgr *CRManager) checkValidVirtualServer(
 	vsName := vsResource.ObjectMeta.Name
 	vkey := fmt.Sprintf("%s/%s", vsNamespace, vsName)
 
-	crInf, ok := crMgr.getNamespaceInformer(vsNamespace)
+	crInf, ok := crMgr.getNamespacedInformer(vsNamespace)
 	if !ok {
 		log.Errorf("Informer not found for namespace: %v", vsNamespace)
 		return false
@@ -43,12 +43,67 @@ func (crMgr *CRManager) checkValidVirtualServer(
 		return false
 	}
 
-	bindAddr := vsResource.Spec.VirtualServerAddress
+	if crMgr.ipamCli == nil {
+		bindAddr := vsResource.Spec.VirtualServerAddress
 
-	// This ensures that pool-only mode only logs the message below the first
-	// time we see a config.
-	if bindAddr == "" {
-		log.Infof("No IP was specified for the virtual server %s", vsName)
+		// This ensures that pool-only mode only logs the message below the first
+		// time we see a config.
+		if bindAddr == "" {
+			log.Infof("No IP was specified for the virtual server %s", vsName)
+			return false
+		}
+	} else {
+		ipamLabel := vsResource.Spec.IPAMLabel
+		if ipamLabel == "" {
+			log.Infof("No ipamLabel was specified for the virtual server %s", vsName)
+			return false
+		}
+	}
+
+	return true
+}
+
+func (crMgr *CRManager) checkValidTransportServer(
+	tsResource *cisapiv1.TransportServer,
+) bool {
+
+	vsNamespace := tsResource.ObjectMeta.Namespace
+	vsName := tsResource.ObjectMeta.Name
+	vkey := fmt.Sprintf("%s/%s", vsNamespace, vsName)
+
+	crInf, ok := crMgr.getNamespacedInformer(vsNamespace)
+	if !ok {
+		log.Errorf("Informer not found for namespace: %v", vsNamespace)
+		return false
+	}
+	// Check if the virtual exists and valid for us.
+	_, virtualFound, _ := crInf.tsInformer.GetIndexer().GetByKey(vkey)
+	if !virtualFound {
+		log.Infof("TransportServer %s is invalid", vsName)
+		return false
+	}
+
+	bindAddr := tsResource.Spec.VirtualServerAddress
+
+	if crMgr.ipamCli == nil {
+		// This ensures that pool-only mode only logs the message below the first
+		// time we see a config.
+		if bindAddr == "" {
+			log.Infof("No IP was specified for the transport server %s", vsName)
+			return false
+		}
+	} else {
+		ipamLabel := tsResource.Spec.IPAMLabel
+		if ipamLabel == "" {
+			log.Infof("No ipamLabel was specified for the transport server %s", vsName)
+			return false
+		}
+	}
+
+	if tsResource.Spec.Type == "" {
+		tsResource.Spec.Type = "tcp"
+	} else if !(tsResource.Spec.Type == "udp" || tsResource.Spec.Type == "tcp") {
+		log.Errorf("Invalid type value for transport server %s. Supported values are tcp and udp only", vsName)
 		return false
 	}
 

@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2016-2019, F5 Networks, Inc.
+ * Copyright (c) 2016-2021, F5 Networks, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,18 +30,28 @@ type (
 		IRules             []IRule             `json:"iRules,omitempty"`
 		InternalDataGroups []InternalDataGroup `json:"internalDataGroups,omitempty"`
 		IApps              []IApp              `json:"iapps,omitempty"`
+		ServiceIPAddress   []ServiceAddress    `json:"serviceAddress,omitempty"`
 	}
 
 	// Config for a single resource (ConfigMap, Ingress, or Route)
 	ResourceConfig struct {
-		MetaData MetaData `json:"-"`
-		Virtual  Virtual  `json:"virtual,omitempty"`
-		IApp     IApp     `json:"iapp,omitempty"`
-		Pools    Pools    `json:"pools,omitempty"`
-		Monitors Monitors `json:"monitors,omitempty"`
-		Policies Policies `json:"policies,omitempty"`
+		MetaData       MetaData         `json:"-"`
+		Virtual        Virtual          `json:"virtual,omitempty"`
+		IApp           IApp             `json:"iapp,omitempty"`
+		Pools          Pools            `json:"pools,omitempty"`
+		Monitors       Monitors         `json:"monitors,omitempty"`
+		Policies       Policies         `json:"policies,omitempty"`
+		ServiceAddress []ServiceAddress `json:"serviceAddress,omitempty"`
 	}
 	ResourceConfigs []*ResourceConfig
+
+	ServiceAddress struct {
+		ArpEnabled         bool   `json:"arpEnabled,omitempty"`
+		ICMPEcho           string `json:"icmpEcho,omitempty"`
+		RouteAdvertisement string `json:"routeAdvertisement,omitempty"`
+		TrafficGroup       string `json:"trafficGroup,omitempty,omitempty"`
+		SpanningEnabled    bool   `json:"spanningEnabled,omitempty"`
+	}
 
 	MetaData struct {
 		Active       bool
@@ -103,6 +113,7 @@ type (
 	Member struct {
 		Address string `json:"address"`
 		Port    int32  `json:"port"`
+		SvcPort int32  `json:"svcPort"`
 		Session string `json:"session,omitempty"`
 	}
 
@@ -249,9 +260,11 @@ type (
 		Cert         string `json:"cert"`
 		Key          string `json:"key"`
 		ServerName   string `json:"serverName,omitempty"`
+		MatchToSNI   string `json:"matchToSNI,omitempty"`
 		SNIDefault   bool   `json:"sniDefault,omitempty"`
 		PeerCertMode string `json:"peerCertMode,omitempty"`
 		CAFile       string `json:"caFile,omitempty"`
+		ChainCA      string `json:"chainCA,onitempty"`
 	}
 
 	// Used to unmarshal ConfigMap data

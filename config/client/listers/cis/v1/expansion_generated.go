@@ -18,6 +18,22 @@ limitations under the License.
 
 package v1
 
+// ExternalDNSListerExpansion allows custom methods to be added to
+// ExternalDNSLister.
+type ExternalDNSListerExpansion interface{}
+
+// ExternalDNSNamespaceListerExpansion allows custom methods to be added to
+// ExternalDNSNamespaceLister.
+type ExternalDNSNamespaceListerExpansion interface{}
+
+// IngressLinkListerExpansion allows custom methods to be added to
+// IngressLinkLister.
+type IngressLinkListerExpansion interface{}
+
+// IngressLinkNamespaceListerExpansion allows custom methods to be added to
+// IngressLinkNamespaceLister.
+type IngressLinkNamespaceListerExpansion interface{}
+
 // TLSProfileListerExpansion allows custom methods to be added to
 // TLSProfileLister.
 type TLSProfileListerExpansion interface{}
@@ -25,6 +41,14 @@ type TLSProfileListerExpansion interface{}
 // TLSProfileNamespaceListerExpansion allows custom methods to be added to
 // TLSProfileNamespaceLister.
 type TLSProfileNamespaceListerExpansion interface{}
+
+// TransportServerListerExpansion allows custom methods to be added to
+// TransportServerLister.
+type TransportServerListerExpansion interface{}
+
+// TransportServerNamespaceListerExpansion allows custom methods to be added to
+// TransportServerNamespaceLister.
+type TransportServerNamespaceListerExpansion interface{}
 
 // VirtualServerListerExpansion allows custom methods to be added to
 // VirtualServerLister.

@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2016-2019, F5 Networks, Inc.
+ * Copyright (c) 2016-2021, F5 Networks, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -121,6 +121,7 @@ type (
 		AddressDiscovery string   `json:"addressDiscovery,omitempty"`
 		ServerAddresses  []string `json:"serverAddresses,omitempty"`
 		ServicePort      int32    `json:"servicePort,omitempty"`
+		ShareNodes       bool     `json:"shareNodes,omitempty"`
 	}
 
 	// as3ResourcePointer maps to following in AS3 Resources
@@ -202,6 +203,7 @@ type (
 
 	// as3TLSServerCertificates maps to TLS_Server_certificates in AS3 Resources
 	as3TLSServerCertificates struct {
+		MatchToSNI  string `json:"matchToSNI,omitempty"`
 		Certificate string `json:"certificate,omitempty"`
 	}
 

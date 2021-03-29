@@ -18,6 +18,12 @@ limitations under the License.
 
 package v1
 
+type ExternalDNSExpansion interface{}
+
+type IngressLinkExpansion interface{}
+
 type TLSProfileExpansion interface{}
+
+type TransportServerExpansion interface{}
 
 type VirtualServerExpansion interface{}

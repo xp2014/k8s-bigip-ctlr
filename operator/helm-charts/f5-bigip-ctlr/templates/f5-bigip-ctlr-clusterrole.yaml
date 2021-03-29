@@ -44,4 +44,40 @@ rules:
       - events
       - ingresses/status
       - routes/status
+  - verbs:
+      - get
+      - list
+      - watch
+      - update
+    apiGroups:
+      - cis.f5.com
+    resources:
+      - virtualservers
+      - tlsprofiles
+      - transportservers
+      - externaldnss
+{{- if .Values.args.ipam }}
+  - verbs:
+      - get
+      - list
+      - watch
+      - update
+      - create
+      - patch
+    apiGroups:
+      - fic.f5.com
+    resources:
+      - f5ipams
+  - verbs:
+      - get
+      - list
+      - watch
+      - update
+      - create
+      - patch
+    apiGroups:
+      - apiextensions.k8s.io
+    resources:
+      - customresourcedefinitions
+{{- end }}
 {{- end -}}

@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2016-2019, F5 Networks, Inc.
+ * Copyright (c) 2016-2021, F5 Networks, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -60,7 +60,7 @@ func (am *AS3Manager) processResourcesForAS3(sharedApp as3Application) {
 		createMonitorDecl(cfg, sharedApp)
 
 		//Create pools
-		createPoolDecl(cfg, sharedApp)
+		createPoolDecl(cfg, sharedApp, am.shareNodes)
 
 		//Create AS3 Service for virtual server
 		createServiceDecl(cfg, sharedApp)
@@ -142,7 +142,7 @@ func getDGRecordValueForAS3(dgName string, sharedApp as3Application) (string, bo
 				if val, ok := svc.ClientTLS.(string); ok {
 					return strings.Join([]string{"", DEFAULT_PARTITION, as3SharedApplication, val}, "/"), true
 				}
-				log.Errorf("Unable to find serverssl for config Group: %v\n", dgName)
+				log.Errorf("Unable to find serverssl for Data Group: %v\n", dgName)
 			}
 		}
 	}
@@ -252,7 +252,7 @@ func createPoliciesDecl(cfg *ResourceConfig, sharedApp as3Application) {
 }
 
 // Create AS3 Pools for Route
-func createPoolDecl(cfg *ResourceConfig, sharedApp as3Application) {
+func createPoolDecl(cfg *ResourceConfig, sharedApp as3Application, shareNodes bool) {
 	for _, v := range cfg.Pools {
 		pool := &as3Pool{}
 		pool.LoadBalancingMode = v.Balance
@@ -262,6 +262,9 @@ func createPoolDecl(cfg *ResourceConfig, sharedApp as3Application) {
 			member.AddressDiscovery = "static"
 			member.ServicePort = val.Port
 			member.ServerAddresses = append(member.ServerAddresses, val.Address)
+			if shareNodes {
+				member.ShareNodes = shareNodes
+			}
 			pool.Members = append(pool.Members, member)
 		}
 		for _, val := range v.MonitorNames {
@@ -531,11 +534,21 @@ func createUpdateCABundle(prof CustomProfile, caBundleName string, sharedApp as3
 
 func createCertificateDecl(prof CustomProfile, sharedApp as3Application) {
 	if "" != prof.Cert && "" != prof.Key {
-		cert := &as3Certificate{
-			Class:       "Certificate",
-			Certificate: prof.Cert,
-			PrivateKey:  prof.Key,
-			ChainCA:     prof.CAFile,
+		var cert *as3Certificate
+		if prof.PeerCertMode == PeerCertRequired {
+			cert = &as3Certificate{
+				Class:       "Certificate",
+				Certificate: prof.Cert,
+				PrivateKey:  prof.Key,
+				ChainCA:     prof.CAFile,
+			}
+		} else {
+			cert = &as3Certificate{
+				Class:       "Certificate",
+				Certificate: prof.Cert,
+				PrivateKey:  prof.Key,
+				ChainCA:     prof.ChainCA,
+			}
 		}
 
 		sharedApp[as3FormattedString(prof.Name, deriveResourceTypeFromAS3Value(prof.Name))] = cert
@@ -566,6 +579,7 @@ func (am *AS3Manager) createUpdateTLSServer(prof CustomProfile, svcName string, 
 			tlsServer.Certificates = append(
 				tlsServer.Certificates,
 				as3TLSServerCertificates{
+					MatchToSNI:  prof.MatchToSNI,
 					Certificate: certName,
 				},
 			)

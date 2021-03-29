@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2017,2018,2019 F5 Networks, Inc.
+ * Copyright (c) 2017-2021 F5 Networks, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ import (
 	log "github.com/F5Networks/k8s-bigip-ctlr/pkg/vlogger"
 	"github.com/F5Networks/k8s-bigip-ctlr/pkg/writer"
 
+	"encoding/json"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -284,13 +285,13 @@ func getVtepMac(
 }
 
 func parseVtepMac(mac, nodeName string) (string, error) {
-	split := strings.Split(mac, "\"")
-	if len(split) < 5 {
-		err := fmt.Errorf("flannel.alpha.coreos.com/backend-data annotation for "+
-			"node '%s' has invalid format; cannot validate VtepMac. "+
-			"Should be of the form: '{\"VtepMAC\":\"<mac>\"}'", nodeName)
-		return "", err
-	} else {
-		return split[3], nil
+	var macDict map[string]interface{}
+	json.Unmarshal([]byte(mac), &macDict)
+	if macAddr, ok := macDict["VtepMAC"]; ok {
+		return macAddr.(string), nil
 	}
+	err := fmt.Errorf("flannel.alpha.coreos.com/backend-data annotation for "+
+		"node '%s' has invalid format; cannot validate VtepMac. "+
+		"Should be of the form: '{\"VtepMAC\":\"<mac>\"}'", nodeName)
+	return "", err
 }

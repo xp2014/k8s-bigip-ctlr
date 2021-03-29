@@ -26,7 +26,10 @@ import (
 
 type K8sV1Interface interface {
 	RESTClient() rest.Interface
+	ExternalDNSsGetter
+	IngressLinksGetter
 	TLSProfilesGetter
+	TransportServersGetter
 	VirtualServersGetter
 }
 
@@ -35,8 +38,20 @@ type K8sV1Client struct {
 	restClient rest.Interface
 }
 
+func (c *K8sV1Client) ExternalDNSs(namespace string) ExternalDNSInterface {
+	return newExternalDNSs(c, namespace)
+}
+
+func (c *K8sV1Client) IngressLinks(namespace string) IngressLinkInterface {
+	return newIngressLinks(c, namespace)
+}
+
 func (c *K8sV1Client) TLSProfiles(namespace string) TLSProfileInterface {
 	return newTLSProfiles(c, namespace)
+}
+
+func (c *K8sV1Client) TransportServers(namespace string) TransportServerInterface {
+	return newTransportServers(c, namespace)
 }
 
 func (c *K8sV1Client) VirtualServers(namespace string) VirtualServerInterface {

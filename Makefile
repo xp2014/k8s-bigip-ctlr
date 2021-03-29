@@ -31,12 +31,7 @@ prod: prod-build
 
 verify: fmt vet
 
-godep-restore: check-gopath
-	godep restore
-	rm -rf vendor Godeps
-
-godep-save: check-gopath
-	godep save ./...
+docs: _docs
 
 clean:
 	rm -rf _docker_workspace
@@ -78,7 +73,7 @@ pre-build:
 	git describe --all --long --always
 
 prod-build: pre-build
-	@echo "Building with minimal instrumentation..."
+	@echo "Building with running tests..."
 	BASE_OS=$(BASE_OS) $(CURDIR)/build-tools/build-devel-image.sh
 	RUN_TESTS=1 BASE_OS=$(BASE_OS) $(CURDIR)/build-tools/build-release-artifacts.sh
 	BASE_OS=$(BASE_OS) $(CURDIR)/build-tools/build-release-images.sh
@@ -86,10 +81,16 @@ prod-build: pre-build
 prod-quick: prod-build-quick
 
 prod-build-quick: pre-build
-	@echo "Building with running tests..."
+	@echo "Building with minimal instrumentation..."
 	BASE_OS=$(BASE_OS) $(CURDIR)/build-tools/build-devel-image.sh
 	RUN_TESTS=0 BASE_OS=$(BASE_OS) $(CURDIR)/build-tools/build-release-artifacts.sh
 	BASE_OS=$(BASE_OS) $(CURDIR)/build-tools/build-release-images.sh
+
+prod-license: pre-build
+	@echo "Building with running test and all_attributions.txt will be generated..."
+	BASE_OS=$(BASE_OS) $(CURDIR)/build-tools/build-devel-image.sh
+	LICENSE=1 RUN_TESTS=1 BASE_OS=$(BASE_OS) $(CURDIR)/build-tools/build-release-artifacts.sh
+	LICENSE=1 BASE_OS=$(BASE_OS) $(CURDIR)/build-tools/build-release-images.sh
 
 debug: pre-build
 	@echo "Building with debug support..."
@@ -118,3 +119,23 @@ reset-dev-patch:
 
 # Build devloper image
 dev: dev-patch prod-quick reset-dev-patch
+
+# Docs
+#
+doc-preview:
+	rm -rf docs/_build
+	DOCKER_RUN_ARGS="-p 127.0.0.1:8000:8000" \
+	  ./build-tools/docker-docs.sh make -C docs preview
+
+_docs: always-build
+	./build-tools/docker-docs.sh ./build-tools/make-docs.sh
+
+docker-test:
+	rm -rf docs/_build
+	./build-tools/docker-docs.sh ./build-tools/make-docs.sh
+
+# one-time html build using a docker container
+.PHONY: docker-html
+docker-html:
+	rm -rf docs/_build
+	./build-tools/docker-docs.sh make -C docs/ html

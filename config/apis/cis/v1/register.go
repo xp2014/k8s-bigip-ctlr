@@ -40,6 +40,12 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&VirtualServerList{},
 		&TLSProfile{},
 		&TLSProfileList{},
+		&IngressLink{},
+		&IngressLinkList{},
+		&TransportServer{},
+		&TransportServerList{},
+		&ExternalDNS{},
+		&ExternalDNSList{},
 	)
 
 	scheme.AddKnownTypes(

@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2016-2019, F5 Networks, Inc.
+ * Copyright (c) 2016-2021, F5 Networks, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,10 @@
 package appmanager
 
 import (
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
+
 	. "github.com/F5Networks/k8s-bigip-ctlr/pkg/resource"
 	log "github.com/F5Networks/k8s-bigip-ctlr/pkg/vlogger"
 
@@ -41,6 +45,14 @@ func (appMgr *Manager) checkValidConfigMap(
 	//check if config map is agent specific implementation.
 	//if ok, add cfgMap name and data to serviceQueueKey.
 	if ok := appMgr.AgentCIS.IsImplInAgent(ResourceTypeCfgMap); ok {
+		//check if configmap has valid json and ignore the cfmap if invalid.
+		if oprType != OprTypeDelete {
+			err := validateConfigJson(cm.Data["template"])
+			if err != nil {
+				log.Errorf("Error processing configmap %v in namespace: %v with err: %v", cm.Name, cm.Namespace, err)
+				return false, nil
+			}
+		}
 		if ok := appMgr.processAgentLabels(cm.Labels, cm.Name, namespace); ok {
 			key := &serviceQueueKey{
 				Namespace: namespace,
@@ -72,6 +84,8 @@ func (appMgr *Manager) checkValidConfigMap(
 	// time we see a config.
 	rsName := FormatConfigMapVSName(cm)
 	// Checking for annotation in VS, not iApp
+	appMgr.resources.Lock()
+	defer appMgr.resources.Unlock()
 	if _, exists := appMgr.resources.GetByName(rsName); !exists &&
 		cfg.MetaData.ResourceType != "iapp" &&
 		cfg.Virtual.VirtualAddress != nil &&
@@ -265,6 +279,16 @@ func (appMgr *Manager) checkValidRoute(
 		return false, nil
 	}
 
+	_, sslAnnotation := route.ObjectMeta.Annotations[F5ClientSslProfileAnnotation]
+	// Validate hostname if certificate is not provided in SSL annotations
+	if nil != route.Spec.TLS && !sslAnnotation {
+		ok := checkCertificateHost(route.Spec.Host, route.Spec.TLS.Certificate, route.Spec.TLS.Key)
+		if !ok {
+			//Invalid certificate and key
+			log.Debugf("[CORE] Invalid certificate and key for route: %v", route.ObjectMeta.Name)
+			return false, nil
+		}
+	}
 	// Validate url-rewrite annotations
 	uri := route.Spec.Host + route.Spec.Path
 	if urlRewrite, ok := route.ObjectMeta.Annotations[F5VsURLRewriteAnnotation]; ok {
@@ -386,4 +410,30 @@ func validateAppRootAnnotations(rsType int, entries map[string]string) {
 			return
 		}
 	}
+}
+
+//Validate certificate hostname
+func checkCertificateHost(host string, certificate string, key string) bool {
+	cert, certErr := tls.X509KeyPair([]byte(certificate), []byte(key))
+	if certErr != nil {
+		log.Errorf("[CORE] Failed to validate TLS cert and key: %v", certErr)
+		return false
+	}
+	x509cert, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		log.Errorf("[CORE] Failed to parse certificate for host %v : %s", host, err)
+		return false
+	}
+	ok := x509cert.VerifyHostname(host)
+	if ok != nil {
+		log.Debugf("[CORE] Error: Hostname in route does not match with certificate hostname: %v", ok)
+	}
+	return true
+}
+
+//validate config json
+func validateConfigJson(tmpConfig string) error {
+	var tmp interface{}
+	err := json.Unmarshal([]byte(tmpConfig), &tmp)
+	return err
 }

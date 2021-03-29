@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2016-2019, F5 Networks, Inc.
+ * Copyright (c) 2016-2021, F5 Networks, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,10 +30,14 @@ import (
 )
 
 const (
-	svcTenantLabel       = "cis.f5.com/as3-tenant="
-	svcAppLabel          = "cis.f5.com/as3-app="
-	svcPoolLabel         = "cis.f5.com/as3-pool="
-	as3SupportedVersion  = 3.18
+	svcTenantLabel      = "cis.f5.com/as3-tenant="
+	svcAppLabel         = "cis.f5.com/as3-app="
+	svcPoolLabel        = "cis.f5.com/as3-pool="
+	as3SupportedVersion = 3.18
+	//Update as3Version,defaultAS3Version,defaultAS3Build while updating AS3 validation schema.
+	as3Version           = 3.25
+	defaultAS3Version    = "3.25.0"
+	defaultAS3Build      = "3"
 	as3tenant            = "Tenant"
 	as3class             = "class"
 	as3SharedApplication = "Shared"
@@ -41,7 +45,7 @@ const (
 	as3shared            = "shared"
 	as3template          = "template"
 	//as3SchemaLatestURL   = "https://raw.githubusercontent.com/F5Networks/f5-appsvcs-extension/master/schema/latest/as3-schema.json"
-	as3SchemaFileName = "as3-schema-3.20.0-3-cis.json"
+	as3SchemaFileName = "as3-schema-3.25.0-3-cis.json"
 )
 
 var baseAS3Config = `{
@@ -102,8 +106,11 @@ type AS3Manager struct {
 	l2l3Agent        L2L3Agent
 	ResourceRequest
 	ResourceResponse
-	as3Version string
-	as3Release string
+	as3Version                string
+	as3SchemaVersion          string
+	as3Release                string
+	unprocessableEntityStatus bool
+	shareNodes                bool
 }
 
 // Struct to allow NewManager to receive all or only specific parameters.
@@ -112,12 +119,12 @@ type Params struct {
 	SchemaLocal               string
 	AS3Validation             bool
 	SSLInsecure               bool
+	IPAM                      bool
 	EnableTLS                 string
 	TLS13CipherGroupReference string
 	Ciphers                   string
 	//Agent                     string
 	OverriderCfgMapName string
-	UserDefinedAS3Decl  string
 	SchemaLocalPath     string
 	FilterTenants       bool
 	BIGIPUsername       string
@@ -128,11 +135,14 @@ type Params struct {
 	ConfigWriter        writer.Writer
 	EventChan           chan interface{}
 	//Log the AS3 response body in Controller logs
-	LogResponse bool
-	RspChan     chan interface{}
-	UserAgent   string
-	As3Version  string
-	As3Release  string
+	LogResponse               bool
+	ShareNodes                bool
+	RspChan                   chan interface{}
+	UserAgent                 string
+	As3Version                string
+	As3Release                string
+	As3SchemaVersion          string
+	unprocessableEntityStatus bool
 }
 
 // Create and return a new app manager that meets the Manager interface
@@ -149,7 +159,9 @@ func NewAS3Manager(params *Params) *AS3Manager {
 		userAgent:                 params.UserAgent,
 		as3Version:                params.As3Version,
 		as3Release:                params.As3Release,
+		as3SchemaVersion:          params.As3SchemaVersion,
 		OverriderCfgMapName:       params.OverriderCfgMapName,
+		shareNodes:                params.ShareNodes,
 		l2l3Agent: L2L3Agent{eventChan: params.EventChan,
 			configWriter: params.ConfigWriter},
 		PostManager: NewPostManager(PostParams{
@@ -188,9 +200,8 @@ func (am *AS3Manager) postAS3Config(tempAS3Config AS3Config) (bool, string) {
 	if unifiedDecl == "" {
 		return true, ""
 	}
-
 	if DeepEqualJSON(am.as3ActiveConfig.unifiedDeclaration, unifiedDecl) {
-		return true, ""
+		return !am.unprocessableEntityStatus, ""
 	}
 
 	if am.as3Validation == true {
@@ -206,7 +217,7 @@ func (am *AS3Manager) postAS3Config(tempAS3Config AS3Config) (bool, string) {
 	var tenants []string = nil
 
 	if am.FilterTenants {
-		tenants = getTenants(unifiedDecl)
+		tenants = getTenants(unifiedDecl, true)
 	}
 
 	return am.PostManager.postConfig(string(unifiedDecl), tenants)
@@ -223,7 +234,7 @@ func (am *AS3Manager) getUnifiedDeclaration(cfg *AS3Config) as3Declaration {
 	// Need to process Routes
 	var as3Obj map[string]interface{}
 
-	baseAS3ConfigTemplate := fmt.Sprintf(baseAS3Config, am.as3Version, am.as3Release, am.as3Version)
+	baseAS3ConfigTemplate := fmt.Sprintf(baseAS3Config, am.as3Version, am.as3Release, am.as3SchemaVersion)
 	_ = json.Unmarshal([]byte(baseAS3ConfigTemplate), &as3Obj)
 	adc, _ := as3Obj["declaration"].(map[string]interface{})
 
@@ -270,7 +281,7 @@ func (am *AS3Manager) getUnifiedDeclaration(cfg *AS3Config) as3Declaration {
 // Function to prepare empty AS3 declaration
 func (am *AS3Manager) getEmptyAs3Declaration(partition string) as3Declaration {
 	var as3Config map[string]interface{}
-	baseAS3ConfigEmpty := fmt.Sprintf(baseAS3Config, am.as3Version, am.as3Release, am.as3Version)
+	baseAS3ConfigEmpty := fmt.Sprintf(baseAS3Config, am.as3Version, am.as3Release, am.as3SchemaVersion)
 	_ = json.Unmarshal([]byte(baseAS3ConfigEmpty), &as3Config)
 	decl := as3Config["declaration"].(map[string]interface{})
 
@@ -288,7 +299,7 @@ func (am *AS3Manager) getEmptyAs3Declaration(partition string) as3Declaration {
 // Function to prepare tenantobjects
 func (am *AS3Manager) getTenantObjects(partitions []string) string {
 	var as3Config map[string]interface{}
-	baseAS3ConfigEmpty := fmt.Sprintf(baseAS3Config, am.as3Version, am.as3Release, am.as3Version)
+	baseAS3ConfigEmpty := fmt.Sprintf(baseAS3Config, am.as3Version, am.as3Release, am.as3SchemaVersion)
 	_ = json.Unmarshal([]byte(baseAS3ConfigEmpty), &as3Config)
 	decl := as3Config["declaration"].(map[string]interface{})
 	for _, partition := range partitions {
@@ -300,7 +311,7 @@ func (am *AS3Manager) getTenantObjects(partitions []string) string {
 }
 
 func (am *AS3Manager) getDeletedTenants(curTenantMap map[string]interface{}) []string {
-	prevTenants := getTenants(am.as3ActiveConfig.unifiedDeclaration)
+	prevTenants := getTenants(am.as3ActiveConfig.unifiedDeclaration, false)
 	var deletedTenants []string
 
 	for _, tnt := range prevTenants {
@@ -317,11 +328,6 @@ func (am *AS3Manager) DeleteAS3Partition(partition string) (bool, string) {
 	return am.PostManager.postConfig(string(emptyAS3Declaration), nil)
 }
 
-func (c AS3Config) Init(partition string) {
-	c.resourceConfig = as3ADC{}
-	c.resourceConfig.initDefault(partition)
-}
-
 // fetchAS3Schema ...
 func (am *AS3Manager) fetchAS3Schema() {
 	log.Debugf("[AS3] Validating AS3 schema with  %v", as3SchemaFileName)
@@ -334,8 +340,8 @@ func (am *AS3Manager) fetchAS3Schema() {
 func (am *AS3Manager) ConfigDeployer() {
 	// For the very first post after starting controller, need not wait to post
 	firstPost := true
+	am.unprocessableEntityStatus = false
 	for msgReq := range am.ReqChan {
-
 		if !firstPost && am.PostManager.AS3PostDelay != 0 {
 			// Time (in seconds) that CIS waits to post the AS3 declaration to BIG-IP.
 			log.Debugf("[AS3] Delaying post to BIG-IP for %v seconds", am.PostManager.AS3PostDelay)
@@ -351,12 +357,14 @@ func (am *AS3Manager) ConfigDeployer() {
 		posted, event := am.postAS3Declaration(msgReq.ResourceRequest)
 		// To handle general errors
 		for !posted {
+			am.unprocessableEntityStatus = true
 			timeout := getTimeDurationForErrorResponse(event)
 			log.Debugf("[AS3] Error handling for event %v", event)
 			posted, event = am.postOnEventOrTimeout(timeout)
 		}
 		firstPost = false
 		if event == responseStatusOk {
+			am.unprocessableEntityStatus = false
 			log.Debugf("[AS3] Preparing response message to response handler")
 			am.SendARPEntries()
 			am.SendAgentResponse()
@@ -373,7 +381,7 @@ func (am *AS3Manager) postOnEventOrTimeout(timeout time.Duration) (bool, string)
 	case <-time.After(timeout):
 		var tenants []string = nil
 		if am.FilterTenants {
-			tenants = getTenants(am.as3ActiveConfig.unifiedDeclaration)
+			tenants = getTenants(am.as3ActiveConfig.unifiedDeclaration, true)
 		}
 		unifiedDeclaration := string(am.as3ActiveConfig.unifiedDeclaration)
 		return am.PostManager.postConfig(unifiedDeclaration, tenants)
@@ -400,26 +408,36 @@ func (am *AS3Manager) postAgentResponse(msgRsp MessageResponse) {
 // compatible with BIG-IP, it will return with error if any one of the
 // requirements are not met
 func (am *AS3Manager) IsBigIPAppServicesAvailable() error {
-	version, build, err := am.PostManager.GetBigipAS3Version()
+	version, build, schemaVersion, err := am.PostManager.GetBigipAS3Version()
 	am.as3Version = version
 	as3Build := build
+	am.as3SchemaVersion = schemaVersion
 	am.as3Release = am.as3Version + "-" + as3Build
 	if err != nil {
 		log.Errorf("[AS3] %v ", err)
 		return err
 	}
 	versionstr := version[:strings.LastIndex(version, ".")]
-	bigIPVersion, err := strconv.ParseFloat(versionstr, 64)
+	bigIPAS3Version, err := strconv.ParseFloat(versionstr, 64)
 	if err != nil {
 		log.Errorf("[AS3] Error while converting AS3 version to float")
 		return err
 	}
-	if bigIPVersion >= as3SupportedVersion {
+	if bigIPAS3Version >= as3SupportedVersion && bigIPAS3Version <= as3Version {
 		log.Debugf("[AS3] BIGIP is serving with AS3 version: %v", version)
+		return nil
+	}
+
+	if bigIPAS3Version > as3Version {
+		am.as3Version = defaultAS3Version
+		am.as3SchemaVersion = fmt.Sprintf("%.2f.0", as3Version)
+		as3Build := defaultAS3Build
+		am.as3Release = am.as3Version + "-" + as3Build
+		log.Debugf("[AS3] BIGIP is serving with AS3 version: %v", bigIPAS3Version)
 		return nil
 	}
 
 	return fmt.Errorf("CIS versions >= 2.0 are compatible with AS3 versions >= %v. "+
 		"Upgrade AS3 version in BIGIP from %v to %v or above.", as3SupportedVersion,
-		bigIPVersion, as3SupportedVersion)
+		bigIPAS3Version, as3SupportedVersion)
 }

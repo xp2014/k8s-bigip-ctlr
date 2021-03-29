@@ -24,7 +24,7 @@ if [ "$GITLAB_CI" == true ]; then
   if id "$user_name" >/dev/null 2>&1; then
     LOCAL_USER_ID=$(sudo id -u $user_name  )
   else
-    adduser -D $user_name
+    adduser $user_name
     LOCAL_USER_ID=$(sudo id -u $user_name)
   fi
 fi
@@ -42,6 +42,7 @@ RUN_ARGS=( \
   -e TRAVIS_REPO_SLUG=$TRAVIS_REPO_SLUG
   -e COVERALLS_TOKEN=$COVERALLS_REPO_TOKEN
   -e RUN_TESTS=$RUN_TESTS
+  -e LICENSE=$LICENSE
   -e BASE_OS=$BASE_OS
   -e DEBUG=$DEBUG
 )

@@ -24,8 +24,14 @@ import (
 
 // Interface provides access to all the informers in this group version.
 type Interface interface {
+	// ExternalDNSs returns a ExternalDNSInformer.
+	ExternalDNSs() ExternalDNSInformer
+	// IngressLinks returns a IngressLinkInformer.
+	IngressLinks() IngressLinkInformer
 	// TLSProfiles returns a TLSProfileInformer.
 	TLSProfiles() TLSProfileInformer
+	// TransportServers returns a TransportServerInformer.
+	TransportServers() TransportServerInformer
 	// VirtualServers returns a VirtualServerInformer.
 	VirtualServers() VirtualServerInformer
 }
@@ -41,9 +47,24 @@ func New(f internalinterfaces.SharedInformerFactory, namespace string, tweakList
 	return &version{factory: f, namespace: namespace, tweakListOptions: tweakListOptions}
 }
 
+// ExternalDNSs returns a ExternalDNSInformer.
+func (v *version) ExternalDNSs() ExternalDNSInformer {
+	return &externalDNSInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// IngressLinks returns a IngressLinkInformer.
+func (v *version) IngressLinks() IngressLinkInformer {
+	return &ingressLinkInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
 // TLSProfiles returns a TLSProfileInformer.
 func (v *version) TLSProfiles() TLSProfileInformer {
 	return &tLSProfileInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// TransportServers returns a TransportServerInformer.
+func (v *version) TransportServers() TransportServerInformer {
+	return &transportServerInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
 // VirtualServers returns a VirtualServerInformer.

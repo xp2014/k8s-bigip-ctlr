@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2016-2019, F5 Networks, Inc.
+ * Copyright (c) 2016-2021, F5 Networks, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -432,7 +432,15 @@ func (appMgr *Manager) createRSConfigFromRoute(
 	}
 	// Create the rule
 	uri := route.Spec.Host + route.Spec.Path
-	rule, err := CreateRule(uri, pool.Name, pool.Partition, FormatRouteRuleName(route))
+
+	var rule *Rule
+	if IsABServiceOfRoute(route, svcName) {
+		poolName := FormatRoutePoolName(route.ObjectMeta.Namespace, route.Spec.To.Name)
+		rule, err = CreateRule(uri, poolName, pool.Partition, FormatRouteRuleName(route))
+	} else {
+		rule, err = CreateRule(uri, pool.Name, pool.Partition, FormatRouteRuleName(route))
+	}
+
 	if nil != err {
 		err = fmt.Errorf("Error configuring rule for Route %s: %v", route.ObjectMeta.Name, err)
 		return &rsCfg, err, Pool{}

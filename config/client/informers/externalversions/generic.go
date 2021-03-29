@@ -53,8 +53,14 @@ func (f *genericInformer) Lister() cache.GenericLister {
 func (f *sharedInformerFactory) ForResource(resource schema.GroupVersionResource) (GenericInformer, error) {
 	switch resource {
 	// Group=k8s.nginx.org, Version=v1
+	case v1.SchemeGroupVersion.WithResource("externaldnss"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.K8s().V1().ExternalDNSs().Informer()}, nil
+	case v1.SchemeGroupVersion.WithResource("ingresslinks"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.K8s().V1().IngressLinks().Informer()}, nil
 	case v1.SchemeGroupVersion.WithResource("tlsprofiles"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.K8s().V1().TLSProfiles().Informer()}, nil
+	case v1.SchemeGroupVersion.WithResource("transportservers"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.K8s().V1().TransportServers().Informer()}, nil
 	case v1.SchemeGroupVersion.WithResource("virtualservers"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.K8s().V1().VirtualServers().Informer()}, nil
 

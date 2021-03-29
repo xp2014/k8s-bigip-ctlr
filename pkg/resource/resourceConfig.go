@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2016-2019, F5 Networks, Inc.
+ * Copyright (c) 2016-2021, F5 Networks, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -279,23 +279,17 @@ func GetRouteServiceNames(route *routeapi.Route) []string {
 	return svcNames
 }
 
-// Deletes a whitelist Condition if the values match
-func (rsCfg *ResourceConfig) DeleteWhitelistCondition(values string) {
+// Deletes a whitelist reset rule
+func (rsCfg *ResourceConfig) DeleteWhitelistCondition() {
 	for _, pol := range rsCfg.Policies {
-		for _, rl := range pol.Rules {
-			for i, cd := range rl.Conditions {
-				var valueStr string
-				for _, val := range cd.Values {
-					valueStr += val + ","
-				}
-				valueStr = strings.TrimSuffix(valueStr, ",")
-				if valueStr == values {
-					copy(rl.Conditions[i:], rl.Conditions[i+1:])
-					rl.Conditions[len(rl.Conditions)-1] = nil
-					rl.Conditions = rl.Conditions[:len(rl.Conditions)-1]
+		for i, rl := range pol.Rules {
+			if strings.HasSuffix(rl.Name, "-reset") {
+				if !pol.RemoveRuleAt(i) {
+					log.Errorf("Error deleting reset rule for %v", pol.Name)
 				}
 			}
 		}
+		rsCfg.SetPolicy(pol)
 	}
 }
 
@@ -304,6 +298,16 @@ func ExistsRouteServiceName(route *routeapi.Route, expSvcName string) bool {
 	// We don't expect an extensive list, so we're not using a map
 	svcs := GetRouteServices(route)
 	for _, svc := range svcs {
+		if expSvcName == svc.Name {
+			return true
+		}
+	}
+	return false
+}
+
+// Verify if the service is associated with the route as AlternateBackend
+func IsABServiceOfRoute(route *routeapi.Route, expSvcName string) bool {
+	for _, svc := range route.Spec.AlternateBackends {
 		if expSvcName == svc.Name {
 			return true
 		}
@@ -2397,6 +2401,7 @@ func NewCustomProfile(
 	sni bool,
 	peerCertMode,
 	caFile string,
+	chainCA string,
 ) CustomProfile {
 	cp := CustomProfile{
 		Name:         profile.Name,
@@ -2407,6 +2412,7 @@ func NewCustomProfile(
 		ServerName:   serverName,
 		SNIDefault:   sni,
 		PeerCertMode: peerCertMode,
+		ChainCA:      chainCA,
 	}
 	if peerCertMode == PeerCertRequired {
 		cp.CAFile = caFile

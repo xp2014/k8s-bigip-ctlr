@@ -52,7 +52,9 @@ func (am *AS3Manager) prepareResourceAS3ConfigMaps() (
 
 			if am.as3Validation == true {
 				if ok := am.validateAS3Template(rscCfgMap.Data); !ok {
-					log.Errorf("[AS3] Error validating AS3 template")
+					log.Errorf("[AS3][Configmap] Error validating AS3 template")
+					log.Errorf("[AS3][Configmap] Error in processing the ConfigMap: %v/%v",
+						rscCfgMap.Namespace, rscCfgMap.Name)
 					continue
 				}
 			}
@@ -76,7 +78,7 @@ func (am *AS3Manager) prepareResourceAS3ConfigMaps() (
 				overriderAS3CfgmapData = rscCfgMap.Data
 			}
 		case StagingAS3Label:
-			tenants := getTenants(as3Declaration(rscCfgMap.Data))
+			tenants := getTenants(as3Declaration(rscCfgMap.Data), true)
 			cfgmap := &AS3ConfigMap{
 				Name:      rscCfgMap.Name,
 				Namespace: rscCfgMap.Namespace,
@@ -123,7 +125,9 @@ func (am *AS3Manager) processCfgMap(rscCfgMap *AgentCfgMap) (
 	as3Tmpl := as3Template(rscCfgMap.Data)
 	obj, ok := getAS3ObjectFromTemplate(as3Tmpl)
 	if !ok {
-		log.Errorf("[AS3] Error processing AS3 template")
+		log.Errorf("[AS3][Configmap] Error processing AS3 template")
+		log.Errorf("[AS3]Error in processing the ConfigMap: %v/%v",
+			rscCfgMap.Namespace, rscCfgMap.Name)
 		return nil, nil
 	}
 
@@ -162,15 +166,18 @@ func (am *AS3Manager) processCfgMap(rscCfgMap *AgentCfgMap) (
 				if len(eps) == 0 {
 					continue
 				}
-				members = append(members, eps...)
+				poolMem := (((poolObj["members"]).([]interface{}))[0]).(map[string]interface{})
 
 				var ips []string
+				var port int32
 				for _, v := range eps {
-					ips = append(ips, v.Address)
+					if int(v.SvcPort) == int(poolMem["servicePort"].(float64)) {
+						ips = append(ips, v.Address)
+						members = append(members, v)
+						port = v.Port
+					}
 				}
-				port := eps[0].Port
 
-				poolMem := (((poolObj["members"]).([]interface{}))[0]).(map[string]interface{})
 				// Replace pool member IP addresses
 				poolMem["serverAddresses"] = ips
 				// Replace port number

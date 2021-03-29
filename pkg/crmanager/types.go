@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2016-2019, F5 Networks, Inc.
+ * Copyright (c) 2016-2021, F5 Networks, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,10 +19,13 @@ package crmanager
 import (
 	"sync"
 
+	"github.com/F5Networks/f5-ipam-controller/pkg/ipammachinery"
 	"github.com/F5Networks/k8s-bigip-ctlr/config/client/clientset/versioned"
+	apm "github.com/F5Networks/k8s-bigip-ctlr/pkg/appmanager"
 	"github.com/F5Networks/k8s-bigip-ctlr/pkg/pollers"
 	"github.com/F5Networks/k8s-bigip-ctlr/pkg/writer"
 	v1 "k8s.io/api/core/v1"
+	extClient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -36,34 +39,33 @@ type (
 		resources        *Resources
 		kubeCRClient     versioned.Interface
 		kubeClient       kubernetes.Interface
+		kubeAPIClient    *extClient.Clientset
 		crInformers      map[string]*CRInformer
+		nsInformer       *NSInformer
+		eventNotifier    *apm.EventNotifier
 		resourceSelector labels.Selector
-		namespaces       []string
+		namespacesMutex  sync.Mutex
+		namespaces       map[string]bool
 		rscQueue         workqueue.RateLimitingInterface
 		Partition        string
 		Agent            *Agent
 		ControllerMode   string
-		// map of rules that have been merged
-		mergedRulesMap  map[string]map[string]mergedRuleEntry
-		nodePoller      pollers.Poller
-		oldNodes        []Node
-		UseNodeInternal bool
-		initState       bool
-		SSLContext      map[string]*v1.Secret
-		customProfiles  *CustomProfileStore
-		// Mutex for irulesMap
-		irulesMutex sync.Mutex
-		// Mutex for intDgMap
-		intDgMutex sync.Mutex
-		// App informer support
-		irulesMap IRulesMap
-		intDgMap  InternalDataGroupMap
-		dgPath    string
+		nodePoller       pollers.Poller
+		oldNodes         []Node
+		UseNodeInternal  bool
+		initState        bool
+		SSLContext       map[string]*v1.Secret
+		customProfiles   *CustomProfileStore
+		dgPath           string
+		shareNodes       bool
+		ipamCli          *ipammachinery.IPAMClient
+		ipamCR           string
 	}
 	// Params defines parameters
 	Params struct {
 		Config            *rest.Config
 		Namespaces        []string
+		NamespaceLabel    string
 		Partition         string
 		Agent             *Agent
 		ControllerMode    string
@@ -72,17 +74,27 @@ type (
 		UseNodeInternal   bool
 		NodePollInterval  int
 		NodeLabelSelector string
+
+		ShareNodes bool
+		IPAM       bool
 	}
 	// CRInformer defines the structure of Custom Resource Informer
 	CRInformer struct {
-		namespace   string
-		stopCh      chan struct{}
-		vsInformer  cache.SharedIndexInformer
-		tsInformer  cache.SharedIndexInformer
-		svcInformer cache.SharedIndexInformer
-		epsInformer cache.SharedIndexInformer
+		namespace    string
+		stopCh       chan struct{}
+		svcInformer  cache.SharedIndexInformer
+		epsInformer  cache.SharedIndexInformer
+		vsInformer   cache.SharedIndexInformer
+		tlsInformer  cache.SharedIndexInformer
+		tsInformer   cache.SharedIndexInformer
+		ilInformer   cache.SharedIndexInformer
+		ednsInformer cache.SharedIndexInformer
 	}
 
+	NSInformer struct {
+		stopCh     chan struct{}
+		nsInformer cache.SharedIndexInformer
+	}
 	rqKey struct {
 		namespace string
 		kind      string
@@ -95,6 +107,7 @@ type (
 		Active       bool
 		ResourceType string
 		rscName      string
+		hosts        []string
 	}
 
 	// Virtual Server Key - unique server is Name + Port
@@ -106,21 +119,38 @@ type (
 
 	// Virtual server config
 	Virtual struct {
-		Name                  string                `json:"name"`
-		PoolName              string                `json:"pool,omitempty"`
-		Partition             string                `json:"-"`
-		Destination           string                `json:"destination"`
-		Enabled               bool                  `json:"enabled"`
-		IpProtocol            string                `json:"ipProtocol,omitempty"`
-		SourceAddrTranslation SourceAddrTranslation `json:"sourceAddressTranslation,omitempty"`
-		Policies              []nameRef             `json:"policies,omitempty"`
-		Profiles              ProfileRefs           `json:"profiles,omitempty"`
-		IRules                []string              `json:"rules,omitempty"`
-		Description           string                `json:"description,omitempty"`
-		VirtualAddress        *virtualAddress       `json:"-"`
+		Name                   string                `json:"name"`
+		PoolName               string                `json:"pool,omitempty"`
+		Partition              string                `json:"-"`
+		Destination            string                `json:"destination"`
+		Enabled                bool                  `json:"enabled"`
+		IpProtocol             string                `json:"ipProtocol,omitempty"`
+		SourceAddrTranslation  SourceAddrTranslation `json:"sourceAddressTranslation,omitempty"`
+		Policies               []nameRef             `json:"policies,omitempty"`
+		Profiles               ProfileRefs           `json:"profiles,omitempty"`
+		IRules                 []string              `json:"rules,omitempty"`
+		Description            string                `json:"description,omitempty"`
+		VirtualAddress         *virtualAddress       `json:"-"`
+		SNAT                   string                `json:"snat,omitempty"`
+		WAF                    string                `json:"waf,omitempty"`
+		Mode                   string                `json:"mode,omitempty"`
+		TranslateServerAddress bool                  `json:"translateServerAddress"`
+		TranslateServerPort    bool                  `json:"translateServerPort"`
+		Source                 string                `json:"source,omitempty"`
+		AllowVLANs             []string              `json:"allowVlans,omitempty"`
+		PersistenceMethods     []string              `json:"-"`
 	}
 	// Virtuals is slice of virtuals
 	Virtuals []Virtual
+
+	// ServiceAddress Service IP address definition (BIG-IP virtual-address).
+	ServiceAddress struct {
+		ArpEnabled         bool   `json:"arpEnabled,omitempty"`
+		ICMPEcho           string `json:"icmpEcho,omitempty"`
+		RouteAdvertisement string `json:"routeAdvertisement,omitempty"`
+		TrafficGroup       string `json:"trafficGroup,omitempty"`
+		SpanningEnabled    bool   `json:"spanningEnabled,omitempty"`
+	}
 
 	// SourceAddrTranslation is Virtual Server Source Address Translation
 	SourceAddrTranslation struct {
@@ -142,20 +172,43 @@ type (
 
 	// ResourceConfig is a Config for a single VirtualServer.
 	ResourceConfig struct {
-		MetaData metaData  `json:"-"`
-		Virtual  Virtual   `json:"virtual,omitempty"`
-		Pools    Pools     `json:"pools,omitempty"`
-		Policies Policies  `json:"policies,omitempty"`
-		Monitors []Monitor `json:"monitors,omitempty"`
+		MetaData       metaData         `json:"-"`
+		Virtual        Virtual          `json:"virtual,omitempty"`
+		Pools          Pools            `json:"pools,omitempty"`
+		Policies       Policies         `json:"policies,omitempty"`
+		Monitors       []Monitor        `json:"monitors,omitempty"`
+		ServiceAddress []ServiceAddress `json:"serviceAddress,omitempty"`
+		IRulesMap      IRulesMap
+		IntDgMap       InternalDataGroupMap
 	}
 	// ResourceConfigs is group of ResourceConfig
 	ResourceConfigs []*ResourceConfig
 
+	DNSConfig map[string]WideIP
+
+	WideIPs struct {
+		WideIPs []WideIP `json:"wideIPs"`
+	}
+
+	WideIP struct {
+		DomainName string     `json:"name"`
+		RecordType string     `json:"recordType"`
+		LBMethod   string     `json:"LoadBalancingMode"`
+		Pools      []GSLBPool `json:"pools"`
+	}
+	GSLBPool struct {
+		Name       string   `json:"name"`
+		RecordType string   `json:"recordType"`
+		LBMethod   string   `json:"LoadBalancingMode"`
+		Members    []string `json:"members"`
+		Monitor    *Monitor `json:"monitor,omitempty"`
+	}
+
 	ResourceConfigWrapper struct {
 		rsCfgs         ResourceConfigs
-		iRuleMap       IRulesMap
-		intDgMap       InternalDataGroupMap
 		customProfiles *CustomProfileStore
+		shareNodes     bool
+		dnsConfig      DNSConfig
 	}
 
 	// Pool config
@@ -173,13 +226,14 @@ type (
 
 	// Monitor is Pool health monitor
 	Monitor struct {
-		Name      string `json:"name"`
-		Partition string `json:"-"`
-		Interval  int    `json:"interval,omitempty"`
-		Type      string `json:"type,omitempty"`
-		Send      string `json:"send,omitempty"`
-		Recv      string `json:"recv,omitempty"`
-		Timeout   int    `json:"timeout,omitempty"`
+		Name       string `json:"name"`
+		Partition  string `json:"-"`
+		Interval   int    `json:"interval,omitempty"`
+		Type       string `json:"type,omitempty"`
+		Send       string `json:"send,omitempty"`
+		Recv       string `json:"recv"`
+		Timeout    int    `json:"timeout,omitempty"`
+		TargetPort int    `json:"timeout,omitempty"`
 	}
 	// Monitors  is slice of monitor
 	Monitors []Monitor
@@ -232,6 +286,8 @@ type (
 		Scheme          bool     `json:"scheme,omitempty"`
 		Tcp             bool     `json:"tcp,omitempty"`
 		Values          []string `json:"values"`
+
+		SSLExtensionClient bool `json:"-"`
 	}
 
 	// Rules is a slice of Rule
@@ -314,14 +370,6 @@ type (
 	}
 )
 
-type serviceQueueKey struct {
-	Namespace   string
-	ServiceName string
-	Name        string // Name of the resource
-	Operation   string
-	Data        string
-}
-
 type (
 	Agent struct {
 		*PostManager
@@ -330,16 +378,19 @@ type (
 		EventChan       chan interface{}
 		PythonDriverPID int
 		activeDecl      as3Declaration
+		userAgent       string
 	}
 
 	AgentParams struct {
 		PostParams PostParams
+		GTMParams  GTMParams
 		//VxlnParams      VXLANParams
 		Partition      string
 		LogLevel       string
 		VerifyInterval int
 		VXLANName      string
 		PythonBaseDir  string
+		UserAgent      string
 	}
 
 	globalSection struct {
@@ -347,6 +398,7 @@ type (
 		VerifyInterval int    `json:"verify-interval,omitempty"`
 		VXLANPartition string `json:"vxlan-partition,omitempty"`
 		DisableLTM     bool   `json:"disable-ltm,omitempty"`
+		GTM            bool   `json:"gtm,omitempty"`
 	}
 
 	bigIPSection struct {
@@ -356,16 +408,13 @@ type (
 		BigIPPartitions []string `json:"partitions,omitempty"`
 	}
 
-	as3Template    string
+	gtmBigIPSection struct {
+		GtmBigIPUsername string `json:"username,omitempty"`
+		GtmBigIPPassword string `json:"password,omitempty"`
+		GtmBigIPURL      string `json:"url,omitempty"`
+	}
+
 	as3Declaration string
-
-	poolName   string
-	appName    string
-	tenantName string
-
-	pool      []Member
-	tenant    map[appName][]poolName
-	as3Object map[tenantName]tenant
 
 	as3JSONWithArbKeys map[string]interface{}
 
@@ -419,6 +468,7 @@ type (
 		Host        *as3PolicyCompareString `json:"host,omitempty"`
 		PathSegment *as3PolicyCompareString `json:"pathSegment,omitempty"`
 		Path        *as3PolicyCompareString `json:"path,omitempty"`
+		ServerName  *as3PolicyCompareString `json:"serverName,omitempty"`
 	}
 
 	// as3ActionForwardSelect maps to Policy_Action_Forward_Select in AS3 Resources
@@ -451,6 +501,7 @@ type (
 		AddressDiscovery string   `json:"addressDiscovery,omitempty"`
 		ServerAddresses  []string `json:"serverAddresses,omitempty"`
 		ServicePort      int32    `json:"servicePort,omitempty"`
+		ShareNodes       bool     `json:"shareNodes,omitempty"`
 	}
 
 	// as3ResourcePointer maps to following in AS3 Resources
@@ -470,20 +521,35 @@ type (
 	// - Service_TCP
 	// - Service_UDP
 	as3Service struct {
-		Layer4                 string            `json:"layer4,omitempty"`
-		Source                 string            `json:"source,omitempty"`
-		TranslateServerAddress bool              `json:"translateServerAddress,omitempty"`
-		TranslateServerPort    bool              `json:"translateServerPort,omitempty"`
-		Class                  string            `json:"class,omitempty"`
-		VirtualAddresses       []string          `json:"virtualAddresses,omitempty"`
-		VirtualPort            int               `json:"virtualPort,omitempty"`
-		SNAT                   string            `json:"snat,omitempty"`
-		PolicyEndpoint         as3MultiTypeParam `json:"policyEndpoint,omitempty"`
-		ClientTLS              as3MultiTypeParam `json:"clientTLS,omitempty"`
-		ServerTLS              as3MultiTypeParam `json:"serverTLS,omitempty"`
-		IRules                 []string          `json:"iRules,omitempty"`
-		Redirect80             *bool             `json:"redirect80,omitempty"`
-		Pool                   string            `json:"pool,omitempty"`
+		Layer4                 string               `json:"layer4,omitempty"`
+		Source                 string               `json:"source,omitempty"`
+		TranslateServerAddress bool                 `json:"translateServerAddress,omitempty"`
+		TranslateServerPort    bool                 `json:"translateServerPort,omitempty"`
+		Class                  string               `json:"class,omitempty"`
+		VirtualAddresses       []as3MultiTypeParam  `json:"virtualAddresses,omitempty"`
+		VirtualPort            int                  `json:"virtualPort,omitempty"`
+		SNAT                   as3MultiTypeParam    `json:"snat,omitempty"`
+		PolicyEndpoint         as3MultiTypeParam    `json:"policyEndpoint,omitempty"`
+		ClientTLS              as3MultiTypeParam    `json:"clientTLS,omitempty"`
+		ServerTLS              as3MultiTypeParam    `json:"serverTLS,omitempty"`
+		IRules                 as3MultiTypeParam    `json:"iRules,omitempty"`
+		Redirect80             *bool                `json:"redirect80,omitempty"`
+		Pool                   string               `json:"pool,omitempty"`
+		WAF                    as3MultiTypeParam    `json:"policyWAF,omitempty"`
+		ProfileL4              string               `json:"profileL4,omitempty"`
+		AllowVLANs             []as3ResourcePointer `json:"allowVlans,omitempty"`
+		PersistenceMethods     []string             `json:"persistenceMethods,omitempty"`
+	}
+
+	// as3ServiceAddress maps to VirtualAddress in AS3 Resources
+	as3ServiceAddress struct {
+		Class              string `json:"class,omitempty"`
+		VirtualAddress     string `json:"virtualAddress,omitempty"`
+		ArpEnabled         bool   `json:"arpEnabled"`
+		ICMPEcho           string `json:"icmpEcho,omitempty"`
+		RouteAdvertisement string `json:"routeAdvertisement,omitempty"`
+		TrafficGroup       string `json:"trafficGroup,omitempty,omitempty"`
+		SpanningEnabled    bool   `json:"spanningEnabled"`
 	}
 
 	// as3Monitor maps to the following in AS3 Resources
@@ -499,8 +565,8 @@ type (
 		TimeUnitilUp      *int    `json:"timeUntilUp,omitempty"`
 		Adaptive          *bool   `json:"adaptive,omitempty"`
 		Dscp              *int    `json:"dscp,omitempty"`
-		Receive           string  `json:"receive,omitempty"`
-		Send              string  `json:"send,omitempty"`
+		Receive           string  `json:"receive"`
+		Send              string  `json:"send"`
 		TargetPort        *int    `json:"targetPort,omitempty"`
 		ClientCertificate string  `json:"clientCertificate,omitempty"`
 		Ciphers           string  `json:"ciphers,omitempty"`
@@ -563,6 +629,7 @@ type (
 	Member struct {
 		Address string `json:"address"`
 		Port    int32  `json:"port"`
+		SvcPort int32  `json:"svcPort,omitempty"`
 		Session string `json:"session,omitempty"`
 	}
 )

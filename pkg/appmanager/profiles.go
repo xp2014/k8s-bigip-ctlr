@@ -17,6 +17,8 @@
 package appmanager
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -65,7 +67,7 @@ func (appMgr *Manager) setClientSslProfile(
 				Context:   CustomProfileClient,
 			}
 			// This is just a basic profile, so we don't need all the fields
-			cp := NewCustomProfile(profile, "", "", "", true, "", "")
+			cp := NewCustomProfile(profile, "", "", "", true, "", "", "")
 			appMgr.customProfiles.Profs[skey] = cp
 			rsCfg.Virtual.AddOrUpdateProfile(profile)
 		}
@@ -103,17 +105,34 @@ func (appMgr *Manager) setClientSslProfile(
 		if "" != route.Spec.TLS.Certificate && "" != route.Spec.TLS.Key {
 			profile := MakeRouteClientSSLProfileRef(
 				rsCfg.Virtual.Partition, sKey.Namespace, route.ObjectMeta.Name)
-
-			cp := NewCustomProfile(
-				profile,
-				route.Spec.TLS.Certificate,
-				route.Spec.TLS.Key,
-				route.Spec.Host,
-				false,
-				"", // peerCertMode
-				"", // caFile
-			)
-
+			var cp CustomProfile
+			if "" != route.Spec.TLS.CACertificate {
+				cp = NewCustomProfile(
+					profile,
+					route.Spec.TLS.Certificate,
+					route.Spec.TLS.Key,
+					route.Spec.Host,
+					false,
+					"",                           // peerCertMode
+					"",                           // caFile
+					route.Spec.TLS.CACertificate, //chainCA
+				)
+			} else {
+				cp = NewCustomProfile(
+					profile,
+					route.Spec.TLS.Certificate,
+					route.Spec.TLS.Key,
+					route.Spec.Host,
+					false,
+					"", // peerCertMode
+					"", // caFile
+					"",
+				)
+			}
+			//check if ecdsa cert.MatchToSNI on TLS_Server adds servername on clientssl profile
+			if isECDSA(route.Spec.TLS.Certificate, route.Spec.TLS.Key) {
+				cp.MatchToSNI = route.Spec.Host
+			}
 			skey := SecretKey{
 				Name:         cp.Name,
 				ResourceName: rsCfg.GetName(),
@@ -216,7 +235,7 @@ func (appMgr *Manager) handleServerSNIDefaultProfile(
 			}
 			// This is just a basic profile, so we don't need all the fields
 			cp := NewCustomProfile(profile, "", "", "", true, peerCert,
-				MakeCertificateFileName(rsCfg.Virtual.Partition, DefaultSslServerCAName))
+				MakeCertificateFileName(rsCfg.Virtual.Partition, DefaultSslServerCAName), "")
 			appMgr.customProfiles.Profs[skey] = cp
 			rsCfg.Virtual.AddOrUpdateProfile(profile)
 		}
@@ -287,6 +306,7 @@ func (appMgr *Manager) handleDestCACert(
 			false,
 			peerCert,
 			"self",
+			"",
 		)
 		caKey := SecretKey{Name: caProfRef.Name}
 		caExistingProf, ok := appMgr.customProfiles.Profs[caKey]
@@ -307,6 +327,7 @@ func (appMgr *Manager) handleDestCACert(
 		false,
 		peerCert,
 		caFile,
+		"",
 	)
 
 	skey := SecretKey{
@@ -367,7 +388,7 @@ func (appMgr *Manager) createSecretSslProfile(
 	}
 	if _, ok := appMgr.customProfiles.Profs[skey]; !ok {
 		// This is just a basic profile, so we don't need all the fields
-		cp := NewCustomProfile(sni, "", "", "", true, "", "")
+		cp := NewCustomProfile(sni, "", "", "", true, "", "", "")
 		appMgr.customProfiles.Profs[skey] = cp
 	}
 	rsCfg.Virtual.AddOrUpdateProfile(sni)
@@ -387,6 +408,7 @@ func (appMgr *Manager) createSecretSslProfile(
 		false, // sni
 		"",    // peerCertMode
 		"",    // caFile
+		"",
 	)
 	skey = SecretKey{
 		Name:         cp.Name,
@@ -429,6 +451,8 @@ func (appMgr *Manager) deleteUnusedProfiles(
 	}
 	// Loop through and delete any profileRefs for cfgs that are
 	// no longer referenced, or have been deleted
+	appMgr.resources.Lock()
+	defer appMgr.resources.Unlock()
 	for _, cfg := range appMgr.resources.GetAllResources() {
 		if cfg.MetaData.ResourceType == "iapp" {
 			continue
@@ -698,7 +722,18 @@ func (appMgr *Manager) loadDefaultCert() (*ProfileRef, bool) {
 				true, //
 				PeerCertDefault,
 				"self", // 'self' indicates this file is the CA file
+				"",
 			)
 	}
 	return &profile, !found
+}
+
+//check if cert is ecdsa signed
+func isECDSA(certificate string, key string) bool {
+	cert, _ := tls.X509KeyPair([]byte(certificate), []byte(key))
+	x509cert, _ := x509.ParseCertificate(cert.Certificate[0])
+	if pka := x509cert.PublicKeyAlgorithm.String(); pka == "ECDSA" {
+		return true
+	}
+	return false
 }

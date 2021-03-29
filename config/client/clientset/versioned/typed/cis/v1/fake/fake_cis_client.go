@@ -28,8 +28,20 @@ type FakeK8sV1 struct {
 	*testing.Fake
 }
 
+func (c *FakeK8sV1) ExternalDNSs(namespace string) v1.ExternalDNSInterface {
+	return &FakeExternalDNSs{c, namespace}
+}
+
+func (c *FakeK8sV1) IngressLinks(namespace string) v1.IngressLinkInterface {
+	return &FakeIngressLinks{c, namespace}
+}
+
 func (c *FakeK8sV1) TLSProfiles(namespace string) v1.TLSProfileInterface {
 	return &FakeTLSProfiles{c, namespace}
+}
+
+func (c *FakeK8sV1) TransportServers(namespace string) v1.TransportServerInterface {
+	return &FakeTransportServers{c, namespace}
 }
 
 func (c *FakeK8sV1) VirtualServers(namespace string) v1.VirtualServerInterface {

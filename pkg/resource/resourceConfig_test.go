@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2016-2019, F5 Networks, Inc.
+ * Copyright (c) 2016-2021, F5 Networks, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -758,6 +758,7 @@ var _ = Describe("Resource Config Tests", func() {
 					"srver",
 					false,
 					PeerCertDefault,
+					"",
 					"")
 				refs := virtual.ReferencesProfile(cprof)
 				Expect(refs).To(BeFalse())
@@ -780,6 +781,7 @@ var _ = Describe("Resource Config Tests", func() {
 						"srver",
 						false,
 						PeerCertDefault,
+						"",
 						"")
 					refs := virtual.ReferencesProfile(cprof)
 					Expect(refs).To(BeTrue())
@@ -791,6 +793,7 @@ var _ = Describe("Resource Config Tests", func() {
 						"srver",
 						false,
 						PeerCertDefault,
+						"",
 						"")
 					refs := virtual.ReferencesProfile(cprof)
 					Expect(refs).To(BeFalse())

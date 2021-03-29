@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2016-2019, F5 Networks, Inc.
+ * Copyright (c) 2016-2021, F5 Networks, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -56,18 +56,19 @@ type ResourceMap map[int32][]*ResourceConfig
 type RoutesMap map[string][]string
 
 type Manager struct {
-	resources         *Resources
-	customProfiles    *CustomProfileStore
-	irulesMap         IRulesMap
-	intDgMap          InternalDataGroupMap
-	agentCfgMap       map[string]*AgentCfgMap
-	kubeClient        kubernetes.Interface
-	restClientv1      rest.Interface
-	restClientv1beta1 rest.Interface
-	routeClientV1     routeclient.RouteV1Interface
-	steadyState       bool
-	queueLen          int
-	processedItems    int
+	resources           *Resources
+	customProfiles      *CustomProfileStore
+	irulesMap           IRulesMap
+	intDgMap            InternalDataGroupMap
+	agentCfgMap         map[string]*AgentCfgMap
+	agentCfgMapSvcCache map[string]*SvcEndPointsCache
+	kubeClient          kubernetes.Interface
+	restClientv1        rest.Interface
+	restClientv1beta1   rest.Interface
+	routeClientV1       routeclient.RouteV1Interface
+	steadyState         bool
+	queueLen            int
+	processedItems      int
 	// Use internal node IPs
 	useNodeInternal bool
 	// Running in nodeport (or cluster) mode
@@ -177,6 +178,11 @@ type RouteConfig struct {
 	ServerSSL   string
 }
 
+type SvcEndPointsCache struct {
+	members     []Member
+	labelString string
+}
+
 var RoutesProcessed []*routeapi.Route
 
 // Create and return a new app manager that meets the Manager interface
@@ -224,6 +230,7 @@ func NewManager(params *Params) *Manager {
 		agRspChan:              params.AgRspChan,
 		processAgentLabels:     params.ProcessAgentLabels,
 		agentCfgMap:            make(map[string]*AgentCfgMap),
+		agentCfgMapSvcCache:    make(map[string]*SvcEndPointsCache),
 	}
 
 	// Initialize agent response worker
@@ -404,7 +411,7 @@ func (appMgr *Manager) syncNamespace(nsName string) error {
 		// Clean up all resources that reference a removed namespace
 		appInf.stopInformers()
 		appMgr.removeNamespaceLocked(nsName)
-		appMgr.eventNotifier.deleteNotifierForNamespace(nsName)
+		appMgr.eventNotifier.DeleteNotifierForNamespace(nsName)
 		appMgr.resources.Lock()
 		rsDeleted := 0
 		appMgr.resources.ForEach(func(key ServiceKey, cfg *ResourceConfig) {
@@ -563,8 +570,12 @@ func (appMgr *Manager) newAppInformer(
 		log.Infof("[CORE] Handling ConfigMap resource events.")
 		appInf.cfgMapInformer.AddEventHandlerWithResyncPeriod(
 			&cache.ResourceEventHandlerFuncs{
-				AddFunc:    func(obj interface{}) { appMgr.enqueueCreatedConfigMap(obj) },
-				UpdateFunc: func(old, cur interface{}) { appMgr.enqueueUpdatedConfigMap(cur) },
+				AddFunc: func(obj interface{}) { appMgr.enqueueCreatedConfigMap(obj) },
+				UpdateFunc: func(old, cur interface{}) {
+					if !reflect.DeepEqual(old, cur) {
+						appMgr.enqueueUpdatedConfigMap(cur)
+					}
+				},
 				DeleteFunc: func(obj interface{}) { appMgr.enqueueDeletedConfigMap(obj) },
 			},
 			resyncPeriod,
@@ -924,8 +935,8 @@ func (appMgr *Manager) syncVirtualServer(sKey serviceQueueKey) error {
 	startTime := time.Now()
 	defer func() {
 		endTime := time.Now()
-		log.Debugf("[CORE] Finished syncing virtual servers %+v %+v (%v)",
-			sKey.Name, sKey.Namespace, endTime.Sub(startTime))
+		log.Debugf("[CORE] Finished syncing virtual servers %+v in namespace %+v (%v)",
+			sKey.ServiceName, sKey.Namespace, endTime.Sub(startTime))
 	}()
 	// Get the informers for the namespace. This will tell us if we care about
 	// this item.
@@ -1031,10 +1042,54 @@ func (appMgr *Manager) syncConfigMaps(
 
 	// Handle delete cfgMap Operation for Agent
 	if appMgr.AgentCIS.IsImplInAgent(ResourceTypeCfgMap) {
+		key := sKey.Namespace + "/" + sKey.Name
 		if sKey.Operation == OprTypeDelete {
-			appMgr.agentCfgMap[sKey.Name].Operation = OprTypeDelete
+			appMgr.agentCfgMap[key].Operation = OprTypeDelete
 			stats.vsDeleted += 1
 			return nil
+		}
+		if nil != svc {
+			tntLabel, tntOk := svc.ObjectMeta.Labels["cis.f5.com/as3-tenant"]
+			appLabel, appOk := svc.ObjectMeta.Labels["cis.f5.com/as3-app"]
+			poolLabel, poolOk := svc.ObjectMeta.Labels["cis.f5.com/as3-pool"]
+
+			selector := "cis.f5.com/as3-tenant=" + tntLabel + "," +
+				"cis.f5.com/as3-app=" + appLabel + "," +
+				"cis.f5.com/as3-pool=" + poolLabel
+
+			key := sKey.Namespace + "/" + sKey.ServiceName
+
+			// A service can be considered as an as3 configmap associated service only when it has these 3 labels
+			if tntOk && appOk && poolOk {
+				//TODO: Sorting endpoints members
+				members := appMgr.getEndpoints(selector, sKey.Namespace)
+
+				if _, ok := appMgr.agentCfgMapSvcCache[key]; !ok {
+					if len(members) != 0 {
+						appMgr.agentCfgMapSvcCache[key] = &SvcEndPointsCache{
+							members:     members,
+							labelString: selector,
+						}
+						stats.poolsUpdated += 1
+						log.Debugf("[CORE] Discovered members for service %v is %v", key, members)
+					}
+				} else {
+					sc := &SvcEndPointsCache{
+						members:     members,
+						labelString: selector,
+					}
+					if len(sc.members) != len(appMgr.agentCfgMapSvcCache[key].members) || !reflect.DeepEqual(sc, appMgr.agentCfgMapSvcCache[key]) {
+						stats.poolsUpdated += 1
+						appMgr.agentCfgMapSvcCache[key] = sc
+						log.Debugf("[CORE] Discovered members for service %v is %v", key, members)
+					}
+				}
+			} else {
+				if _, ok := appMgr.agentCfgMapSvcCache[key]; ok {
+					stats.poolsUpdated += 1
+					delete(appMgr.agentCfgMapSvcCache, key)
+				}
+			}
 		}
 	}
 
@@ -1056,11 +1111,27 @@ func (appMgr *Manager) syncConfigMaps(
 		}
 
 		if appMgr.AgentCIS.IsImplInAgent(ResourceTypeCfgMap) {
+			//ignore invalid as3 configmaps if found.
+			if sKey.Operation != OprTypeDelete {
+				err := validateConfigJson(cm.Data["template"])
+				if err != nil {
+					continue
+				}
+			}
 			if ok := appMgr.processAgentLabels(cm.Labels, cm.Name, cm.Namespace); ok {
 				agntCfgMap := new(AgentCfgMap)
 				agntCfgMap.Init(cm.Name, cm.Namespace, cm.Data["template"], cm.Labels, appMgr.getEndpoints)
-				appMgr.agentCfgMap[cm.Name] = agntCfgMap
-				stats.vsUpdated += 1
+				key := cm.Namespace + "/" + cm.Name
+				if cfgMap, ok := appMgr.agentCfgMap[key]; ok {
+					if cfgMap.Data != cm.Data["template"] || cm.Labels["as3"] != cfgMap.Label["as3"] || cm.Labels["overrideAS3"] != cfgMap.Label["overrideAS3"] {
+						appMgr.agentCfgMap[key] = agntCfgMap
+						stats.vsUpdated += 1
+					}
+
+				} else {
+					appMgr.agentCfgMap[key] = agntCfgMap
+					stats.vsUpdated += 1
+				}
 			}
 			continue
 		}
@@ -1313,9 +1384,6 @@ func (appMgr *Manager) syncIngresses(
 						}
 					}
 				}
-				if dep.Kind == WhitelistDep {
-					rsCfg.DeleteWhitelistCondition(dep.Name)
-				}
 			}
 
 			if ok, found, updated := appMgr.handleConfigForType(
@@ -1378,9 +1446,19 @@ func (appMgr *Manager) syncRoutes(
 	bufferF5Res := InternalF5Resources{}
 
 	var routesProcessed []string
+	routePathMap := make(map[string]string)
 	for _, route := range routeByIndex {
 		if route.ObjectMeta.Namespace != sKey.Namespace {
 			continue
+		}
+		key := route.Spec.Host + route.Spec.Path
+		if host, ok := routePathMap[key]; ok {
+			if host == route.Spec.Host {
+				log.Debugf("[CORE] Route exist with same host: %v and path: %v", route.Spec.Host, route.Spec.Path)
+				continue
+			}
+		} else {
+			routePathMap[key] = route.Spec.Host
 		}
 		routesProcessed = append(routesProcessed, route.ObjectMeta.Name)
 
@@ -1517,7 +1595,7 @@ func (appMgr *Manager) syncRoutes(
 					}
 				}
 				if dep.Kind == WhitelistDep {
-					rsCfg.DeleteWhitelistCondition(dep.Name)
+					rsCfg.DeleteWhitelistCondition()
 				}
 			}
 			// Sort the rules
@@ -1815,12 +1893,16 @@ func (appMgr *Manager) handleConfigForType(
 	var reason string
 	var msg string
 
-	if appMgr.IsNodePort() {
-		correctBackend, reason, msg =
-			appMgr.updatePoolMembersForNodePort(svc, svcKey, rsCfg, plIdx)
+	if svc.ObjectMeta.Labels["component"] == "apiserver" && svc.ObjectMeta.Labels["provider"] == "kubernetes" {
+		appMgr.exposeKubernetesService(svc, svcKey, rsCfg, appInf, plIdx)
 	} else {
-		correctBackend, reason, msg =
-			appMgr.updatePoolMembersForCluster(svc, svcKey, rsCfg, appInf, plIdx)
+		if appMgr.IsNodePort() {
+			correctBackend, reason, msg =
+				appMgr.updatePoolMembersForNodePort(svc, svcKey, rsCfg, plIdx)
+		} else {
+			correctBackend, reason, msg =
+				appMgr.updatePoolMembersForCluster(svc, svcKey, rsCfg, appInf, plIdx)
+		}
 	}
 
 	// This will only update the config if the vs actually changed.
@@ -1853,6 +1935,14 @@ func (appMgr *Manager) syncPoolMembers(rsName string, rsCfg *ResourceConfig) {
 				}
 			}
 		}
+		//for iApp resource update IAppPoolMemberTable with members found for pool.
+		if rsCfg.MetaData.ResourceType == "iapp" {
+			for _, p := range rsCfg.Pools {
+				if rsCfg.IApp.Name == p.Name {
+					rsCfg.IApp.IAppPoolMemberTable.Members = p.Members
+				}
+			}
+		}
 	}
 }
 
@@ -1869,8 +1959,12 @@ func (appMgr *Manager) updatePoolMembersForNodePort(
 					svcKey, portSpec.NodePort)
 				rsCfg.MetaData.Active = true
 				rsCfg.Pools[index].Members =
-					appMgr.getEndpointsForNodePort(portSpec.NodePort)
+					appMgr.getEndpointsForNodePort(portSpec.NodePort, portSpec.Port)
 			}
+		}
+		//check if endpoints are found
+		if rsCfg.Pools[index].Members == nil {
+			log.Errorf("[CORE]Endpoints could not be fetched for service %v with port %v", svcKey.ServiceName, svcKey.ServicePort)
 		}
 		return true, "", ""
 	} else {
@@ -1903,6 +1997,10 @@ func (appMgr *Manager) updatePoolMembersForCluster(
 			rsCfg.MetaData.Active = true
 			rsCfg.Pools[index].Members = ipPorts
 		}
+	}
+	//check if endpoints are found
+	if rsCfg.Pools[index].Members == nil {
+		log.Errorf("[CORE]Endpoints could not be fetched for service %v with port %v", sKey.ServiceName, sKey.ServicePort)
 	}
 	return true, "", ""
 }
@@ -2232,6 +2330,7 @@ func (appMgr *Manager) getEndpointsForCluster(
 						member := Member{
 							Address: addr.IP,
 							Port:    p.Port,
+							SvcPort: p.Port,
 							Session: "user-enabled",
 						}
 						members = append(members, member)
@@ -2244,7 +2343,7 @@ func (appMgr *Manager) getEndpointsForCluster(
 }
 
 func (appMgr *Manager) getEndpointsForNodePort(
-	nodePort int32,
+	nodePort, port int32,
 ) []Member {
 	nodes := appMgr.getNodesFromCache()
 	var members []Member
@@ -2252,6 +2351,7 @@ func (appMgr *Manager) getEndpointsForNodePort(
 		member := Member{
 			Address: v.Addr,
 			Port:    nodePort,
+			SvcPort: port,
 			Session: "user-enabled",
 		}
 		members = append(members, member)
@@ -2281,9 +2381,9 @@ func handleConfigMapParseFailure(
 		}
 		sKey := ServiceKey{serviceName, servicePort, cm.ObjectMeta.Namespace}
 		rsName := FormatConfigMapVSName(cm)
+		appMgr.resources.Lock()
+		defer appMgr.resources.Unlock()
 		if _, ok := appMgr.resources.Get(sKey, rsName); ok {
-			appMgr.resources.Lock()
-			defer appMgr.resources.Unlock()
 			appMgr.resources.Delete(sKey, rsName)
 			delete(cm.ObjectMeta.Annotations, VsStatusBindAddrAnnotation)
 			appMgr.kubeClient.CoreV1().ConfigMaps(cm.ObjectMeta.Namespace).Update(cm)
@@ -2404,6 +2504,23 @@ func containsNode(nodes []Node, name string) bool {
 	return false
 }
 
+type byTimestamp []v1.Service
+
+//sort services by timestamp
+func (slice byTimestamp) Len() int {
+	return len(slice)
+}
+
+func (slice byTimestamp) Less(i, j int) bool {
+	d1 := slice[i].GetCreationTimestamp()
+	d2 := slice[j].GetCreationTimestamp()
+	return d1.Before(&d2)
+}
+
+func (slice byTimestamp) Swap(i, j int) {
+	slice[i], slice[j] = slice[j], slice[i]
+}
+
 // Performs Service discovery for the given AS3 Pool and returns a pool.
 // Service discovery is loosely coupled with Kubernetes Service labels. A Kubernetes Service is treated as a match for
 // an AS3 Pool, if the Kubernetes Service have the following labels and their values matches corresponding AS3
@@ -2431,14 +2548,16 @@ func (m *Manager) getEndpoints(selector, namespace string) []Member {
 	}
 
 	if len(services.Items) > 1 {
-		svcNames := ""
+		svcName := ""
+		sort.Sort(byTimestamp(services.Items))
+		//picking up the oldest service
+		services.Items = services.Items[:1]
 
 		for _, service := range services.Items {
-			svcNames += fmt.Sprintf("Service: %v, Namespace: %v \n", service.Name, service.Namespace)
+			svcName += fmt.Sprintf("Service: %v, Namespace: %v,Timestamp: %v\n", service.Name, service.Namespace, service.GetCreationTimestamp())
 		}
 
-		log.Errorf("[CORE] Multiple Services are tagged for this pool. Ignoring all endpoints.\n%v", svcNames)
-		return members
+		log.Warningf("[CORE] Multiple Services are tagged for this pool. Using oldest service endpoints.\n%v", svcName)
 	}
 
 	for _, service := range services.Items {
@@ -2456,23 +2575,67 @@ func (m *Manager) getEndpoints(selector, namespace string) []Member {
 			for _, endpoints := range endpointsList.Items {
 				for _, subset := range endpoints.Subsets {
 					for _, address := range subset.Addresses {
-						member := Member{
-							Address: address.IP,
-							Port:    subset.Ports[0].Port,
+						for _, port := range subset.Ports {
+							member := Member{
+								Address: address.IP,
+								Port:    port.Port,
+								SvcPort: port.Port,
+							}
+							members = append(members, member)
 						}
-						members = append(members, member)
+
 					}
 				}
 			}
 		} else { // Controller is in NodePort mode.
 			if service.Spec.Type == v1.ServiceTypeNodePort {
-				members = m.getEndpointsForNodePort(service.Spec.Ports[0].NodePort)
+				for _, port := range service.Spec.Ports {
+					members = append(members, m.getEndpointsForNodePort(port.NodePort, port.Port)...)
+				}
 			} /* else {
 				msg := fmt.Sprintf("[CORE] Requested service backend '%+v' not of NodePort type", service.Name)
 				log.Debug(msg)
 			}*/
 		}
 	}
-
 	return members
+}
+
+func (appMgr *Manager) exposeKubernetesService(
+	svc *v1.Service,
+	sKey ServiceKey,
+	rsCfg *ResourceConfig,
+	appInf *appInformer,
+	index int,
+) (bool, string, string) {
+	svcKey := sKey.Namespace + "/" + sKey.ServiceName
+	item, found, _ := appInf.endptInformer.GetStore().GetByKey(svcKey)
+	if !found {
+		msg := fmt.Sprintf("Endpoints for service '%v' not found!", svcKey)
+		log.Debug(msg)
+		return false, "EndpointsNotFound", msg
+	}
+	eps, _ := item.(*v1.Endpoints)
+	for _, portSpec := range svc.Spec.Ports {
+		if portSpec.Port == sKey.ServicePort {
+			var members []Member
+			for _, subset := range eps.Subsets {
+				for _, p := range subset.Ports {
+					if portSpec.Name == p.Name {
+						for _, addr := range subset.Addresses {
+							member := Member{
+								Address: addr.IP,
+								Port:    p.Port,
+							}
+							members = append(members, member)
+						}
+					}
+				}
+			}
+			log.Debugf("[CORE] Found endpoints for backend %+v: %v", sKey, members)
+			rsCfg.MetaData.Active = true
+			rsCfg.Pools[index].Members = members
+		}
+	}
+	return true, "", ""
 }
