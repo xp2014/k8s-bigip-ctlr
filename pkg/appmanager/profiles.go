@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	netv1 "k8s.io/api/networking/v1"
 	"reflect"
 	"strings"
 
@@ -539,29 +540,78 @@ func (appMgr *Manager) deleteUnusedProfiles(
 				ingresses, _ := appInf.ingInformer.GetIndexer().ByIndex(
 					"namespace", namespace)
 				for _, obj := range ingresses {
-					ing := obj.(*v1beta1.Ingress)
-					if 0 == len(ing.Spec.TLS) {
-						// Nothing to do if no TLS section
-						continue
-					}
-					for _, tls := range ing.Spec.TLS {
-						appMgr.checkProfile(
-							prof,
-							&toRemove,
-							ing.ObjectMeta.Namespace,
-							tls.SecretName,
-							&referenced,
-						)
-					}
-					if serverProfile, ok :=
-						ing.ObjectMeta.Annotations[F5ServerSslProfileAnnotation]; ok == true {
-						appMgr.checkProfile(
-							prof,
-							&toRemove,
-							ing.ObjectMeta.Namespace,
-							serverProfile,
-							&referenced,
-						)
+					//TODO remove the switch case and checkV1beta1Ingress function
+					switch obj.(type) {
+					case *v1beta1.Ingress:
+						ing := obj.(*v1beta1.Ingress)
+						if 0 == len(ing.Spec.TLS) {
+							// Nothing to do if no TLS section
+							continue
+						}
+						for _, tls := range ing.Spec.TLS {
+							appMgr.checkProfile(
+								prof,
+								&toRemove,
+								ing.ObjectMeta.Namespace,
+								tls.SecretName,
+								&referenced,
+							)
+						}
+						if serverProfile, ok :=
+							ing.ObjectMeta.Annotations[F5ServerSslProfileAnnotation]; ok == true {
+							appMgr.checkProfile(
+								prof,
+								&toRemove,
+								ing.ObjectMeta.Namespace,
+								serverProfile,
+								&referenced,
+							)
+						}
+					default:
+						ing := obj.(*netv1.Ingress)
+						if 0 == len(ing.Spec.TLS) && len(ing.ObjectMeta.Annotations[F5ClientSslProfileAnnotation]) == 0 {
+							// Nothing to do if no TLS section
+							continue
+						}
+						if len(ing.ObjectMeta.Annotations[F5ClientSslProfileAnnotation]) > 0 {
+							if profiles, err := appMgr.getProfilesFromAnnotations(ing.ObjectMeta.Annotations[F5ClientSslProfileAnnotation], ing); err != nil {
+								msg := fmt.Sprintf(
+									"Unable to parse bigip clientssl profile JSON array '%v': %v", ing.ObjectMeta.Annotations[F5ClientSslProfileAnnotation], err)
+								log.Errorf("[CORE] %s", msg)
+							} else {
+								for _, profile := range profiles {
+									referenced = true
+									appMgr.checkProfile(
+										prof,
+										&toRemove,
+										ing.ObjectMeta.Namespace,
+										fmt.Sprintf("/%v/%v", profile.Partition, profile.Name),
+										&referenced,
+									)
+								}
+							}
+						} else {
+							for _, tls := range ing.Spec.TLS {
+								appMgr.checkProfile(
+									prof,
+									&toRemove,
+									ing.ObjectMeta.Namespace,
+									tls.SecretName,
+									&referenced,
+								)
+							}
+						}
+
+						if serverProfile, ok :=
+							ing.ObjectMeta.Annotations[F5ServerSslProfileAnnotation]; ok == true {
+							appMgr.checkProfile(
+								prof,
+								&toRemove,
+								ing.ObjectMeta.Namespace,
+								serverProfile,
+								&referenced,
+							)
+						}
 					}
 					if referenced {
 						break
@@ -731,9 +781,11 @@ func (appMgr *Manager) loadDefaultCert() (*ProfileRef, bool) {
 //check if cert is ecdsa signed
 func isECDSA(certificate string, key string) bool {
 	cert, _ := tls.X509KeyPair([]byte(certificate), []byte(key))
-	x509cert, _ := x509.ParseCertificate(cert.Certificate[0])
-	if pka := x509cert.PublicKeyAlgorithm.String(); pka == "ECDSA" {
-		return true
+	if len(cert.Certificate) > 0 {
+		x509cert, _ := x509.ParseCertificate(cert.Certificate[0])
+		if pka := x509cert.PublicKeyAlgorithm.String(); pka == "ECDSA" {
+			return true
+		}
 	}
 	return false
 }

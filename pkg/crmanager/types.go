@@ -19,6 +19,8 @@ package crmanager
 import (
 	"sync"
 
+	"github.com/F5Networks/k8s-bigip-ctlr/pkg/teem"
+
 	"github.com/F5Networks/f5-ipam-controller/pkg/ipammachinery"
 	"github.com/F5Networks/k8s-bigip-ctlr/config/client/clientset/versioned"
 	apm "github.com/F5Networks/k8s-bigip-ctlr/pkg/appmanager"
@@ -36,47 +38,48 @@ import (
 type (
 	// CRManager defines the structure of Custom Resource Manager
 	CRManager struct {
-		resources        *Resources
-		kubeCRClient     versioned.Interface
-		kubeClient       kubernetes.Interface
-		kubeAPIClient    *extClient.Clientset
-		crInformers      map[string]*CRInformer
-		nsInformer       *NSInformer
-		eventNotifier    *apm.EventNotifier
-		resourceSelector labels.Selector
-		namespacesMutex  sync.Mutex
-		namespaces       map[string]bool
-		rscQueue         workqueue.RateLimitingInterface
-		Partition        string
-		Agent            *Agent
-		ControllerMode   string
-		nodePoller       pollers.Poller
-		oldNodes         []Node
-		UseNodeInternal  bool
-		initState        bool
-		SSLContext       map[string]*v1.Secret
-		customProfiles   *CustomProfileStore
-		dgPath           string
-		shareNodes       bool
-		ipamCli          *ipammachinery.IPAMClient
-		ipamCR           string
+		resources          *Resources
+		kubeCRClient       versioned.Interface
+		kubeClient         kubernetes.Interface
+		kubeAPIClient      *extClient.Clientset
+		crInformers        map[string]*CRInformer
+		nsInformer         *NSInformer
+		eventNotifier      *apm.EventNotifier
+		resourceSelector   labels.Selector
+		namespacesMutex    sync.Mutex
+		namespaces         map[string]bool
+		rscQueue           workqueue.RateLimitingInterface
+		Partition          string
+		Agent              *Agent
+		ControllerMode     string
+		nodePoller         pollers.Poller
+		oldNodes           []Node
+		UseNodeInternal    bool
+		initState          bool
+		SSLContext         map[string]*v1.Secret
+		dgPath             string
+		shareNodes         bool
+		ipamCli            *ipammachinery.IPAMClient
+		ipamCR             string
+		defaultRouteDomain int
+		TeemData           *teem.TeemsData
 	}
 	// Params defines parameters
 	Params struct {
-		Config            *rest.Config
-		Namespaces        []string
-		NamespaceLabel    string
-		Partition         string
-		Agent             *Agent
-		ControllerMode    string
-		VXLANName         string
-		VXLANMode         string
-		UseNodeInternal   bool
-		NodePollInterval  int
-		NodeLabelSelector string
-
-		ShareNodes bool
-		IPAM       bool
+		Config             *rest.Config
+		Namespaces         []string
+		NamespaceLabel     string
+		Partition          string
+		Agent              *Agent
+		ControllerMode     string
+		VXLANName          string
+		VXLANMode          string
+		UseNodeInternal    bool
+		NodePollInterval   int
+		NodeLabelSelector  string
+		ShareNodes         bool
+		IPAM               bool
+		DefaultRouteDomain int
 	}
 	// CRInformer defines the structure of Custom Resource Informer
 	CRInformer struct {
@@ -180,6 +183,7 @@ type (
 		ServiceAddress []ServiceAddress `json:"serviceAddress,omitempty"`
 		IRulesMap      IRulesMap
 		IntDgMap       InternalDataGroupMap
+		customProfiles CustomProfileStore
 	}
 	// ResourceConfigs is group of ResourceConfig
 	ResourceConfigs []*ResourceConfig
@@ -205,10 +209,11 @@ type (
 	}
 
 	ResourceConfigWrapper struct {
-		rsCfgs         ResourceConfigs
-		customProfiles *CustomProfileStore
-		shareNodes     bool
-		dnsConfig      DNSConfig
+		rsCfgs             ResourceConfigs
+		customProfiles     *CustomProfileStore
+		shareNodes         bool
+		dnsConfig          DNSConfig
+		defaultRouteDomain int
 	}
 
 	// Pool config
@@ -233,10 +238,17 @@ type (
 		Send       string `json:"send,omitempty"`
 		Recv       string `json:"recv"`
 		Timeout    int    `json:"timeout,omitempty"`
-		TargetPort int    `json:"timeout,omitempty"`
+		TargetPort int32  `json:"targetPort,omitempty"`
 	}
 	// Monitors  is slice of monitor
 	Monitors []Monitor
+
+	// This is the format for each item in the health monitor annotation used
+	// in the ServiceType LB objects.
+	ServiceTypeLBHealthMonitor struct {
+		Interval int `json:"interval"`
+		Timeout  int `json:"timeout"`
+	}
 
 	// Rule config for a Policy
 	Rule struct {
@@ -567,7 +579,7 @@ type (
 		Dscp              *int    `json:"dscp,omitempty"`
 		Receive           string  `json:"receive"`
 		Send              string  `json:"send"`
-		TargetPort        *int    `json:"targetPort,omitempty"`
+		TargetPort        *int32  `json:"targetPort,omitempty"`
 		ClientCertificate string  `json:"clientCertificate,omitempty"`
 		Ciphers           string  `json:"ciphers,omitempty"`
 	}

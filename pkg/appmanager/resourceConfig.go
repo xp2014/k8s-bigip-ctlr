@@ -18,6 +18,7 @@ package appmanager
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -30,6 +31,7 @@ import (
 )
 
 // Create a ResourceConfig based on an Ingress resource config
+// TODO remove the function once v1beta1.Ingress is deprecated in k8s 1.22
 func (appMgr *Manager) createRSConfigFromIngress(
 	ing *v1beta1.Ingress,
 	resources *Resources,
@@ -227,6 +229,8 @@ func (appMgr *Manager) createRSConfigFromIngress(
 					if rl.Name == newRule.Name || (!IsAnnotationRule(rl.Name) &&
 						!IsAnnotationRule(newRule.Name) && rl.FullURI == newRule.FullURI) {
 						found = true
+						// Replace old rule with new rule, but make sure Ordinal is correct.
+						newRule.Ordinal = rl.Ordinal
 						policy.Rules[i] = newRule
 						break
 					}
@@ -253,11 +257,15 @@ func (appMgr *Manager) createRSConfigFromIngress(
 	if len(urlRewriteRefs) > 0 || len(appRootRefs) > 0 {
 		cfg.MergeRules(appMgr.mergedRulesMap)
 	}
-
+	// Sort the rules
+	for _, policy := range cfg.Policies {
+		sort.Sort(sort.Reverse(&policy.Rules))
+	}
 	return &cfg
 }
 
 // Return value is whether or not a custom profile was updated
+// TODO remove the function once v1beta1.Ingress is deprecated in k8s 1.22
 func (appMgr *Manager) handleIngressTls(
 	rsCfg *ResourceConfig,
 	ing *v1beta1.Ingress,
@@ -553,7 +561,7 @@ func (appMgr *Manager) handleRouteRules(
 				rc.Virtual.AddIRule(abPathIRuleName)
 			} else {
 				rc.AddRuleToPolicy(policyName, rule)
-				SetAnnotationRulesForRoute(policyName, urlRewriteRule, appRootRules, rc)
+				SetAnnotationRulesForRoute(policyName, urlRewriteRule, appRootRules, rc, false)
 			}
 		} else {
 			// Handle redirect policy for edge. Reencrypt and passthrough do not
@@ -566,7 +574,7 @@ func (appMgr *Manager) handleRouteRules(
 						rc.Virtual.AddIRule(abPathIRuleName)
 					} else {
 						rc.AddRuleToPolicy(policyName, rule)
-						SetAnnotationRulesForRoute(policyName, urlRewriteRule, appRootRules, rc)
+						SetAnnotationRulesForRoute(policyName, urlRewriteRule, appRootRules, rc, false)
 					}
 				case routeapi.InsecureEdgeTerminationPolicyRedirect:
 					redirectIRuleName := JoinBigipPath(DEFAULT_PARTITION,
@@ -583,7 +591,7 @@ func (appMgr *Manager) handleRouteRules(
 					svcFwdRulesMap.AddEntry(route.ObjectMeta.Namespace, route.Spec.To.Name,
 						route.Spec.Host, path)
 					rc.AddRuleToPolicy(policyName, rule)
-					SetAnnotationRulesForRoute(policyName, urlRewriteRule, appRootRules, rc)
+					SetAnnotationRulesForRoute(policyName, urlRewriteRule, appRootRules, rc, true)
 				}
 			}
 		}
@@ -606,7 +614,7 @@ func (appMgr *Manager) handleRouteRules(
 					appMgr.addInternalDataGroup(EdgeServerSslDgName, DEFAULT_PARTITION)
 					rc.Virtual.AddIRule(passThroughIRuleName)
 					rc.AddRuleToPolicy(policyName, rule)
-					SetAnnotationRulesForRoute(policyName, urlRewriteRule, appRootRules, rc)
+					SetAnnotationRulesForRoute(policyName, urlRewriteRule, appRootRules, rc, false)
 				}
 			case routeapi.TLSTerminationPassthrough:
 				appMgr.addIRule(
@@ -621,7 +629,7 @@ func (appMgr *Manager) handleRouteRules(
 				rc.Virtual.AddIRule(passThroughIRuleName)
 				if !abDeployment {
 					rc.AddRuleToPolicy(policyName, rule)
-					SetAnnotationRulesForRoute(policyName, urlRewriteRule, appRootRules, rc)
+					SetAnnotationRulesForRoute(policyName, urlRewriteRule, appRootRules, rc, false)
 				}
 			}
 		}

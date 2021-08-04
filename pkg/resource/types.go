@@ -331,6 +331,14 @@ type (
 	}
 	AnnotationHealthMonitors []AnnotationHealthMonitor
 
+	// This is the format for each item in the clientssl annotation used
+	// in the Ingress objects.
+	AnnotationProfile struct {
+		hosts        []string `json:"hosts"`
+		Bigipprofile string   `json:"bigIpProfile"`
+	}
+	AnnotationProfiles []AnnotationProfile
+
 	RuleData struct {
 		SvcName   string
 		SvcPort   int32
@@ -507,7 +515,9 @@ const F5ServerSslSecureAnnotation = "virtual-server.f5.com/secure-serverssl"
 const DefaultSslServerCAName = "openshift_route_cluster_default-ca"
 const F5VsWAFPolicy = "virtual-server.f5.com/waf"
 const OprTypeCreate = "create"
-const OprTypeModify = "modify"
+const OprTypeUpdate = "update"
 const OprTypeDelete = "delete"
+const CISControllerName = "f5.com/cntr-ingress-svcs"
+const DefaultIngressClass = "ingressclass.kubernetes.io/is-default-class"
 
 //const DefaultSslServerCAName = "openshift_route_cluster_default-ca"

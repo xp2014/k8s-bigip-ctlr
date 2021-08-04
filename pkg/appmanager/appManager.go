@@ -17,6 +17,7 @@
 package appmanager
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -27,27 +28,30 @@ import (
 	"sync"
 	"time"
 
+	"github.com/F5Networks/k8s-bigip-ctlr/pkg/teem"
+
+	netv1 "k8s.io/api/networking/v1"
+
 	cisAgent "github.com/F5Networks/k8s-bigip-ctlr/pkg/agent"
 	bigIPPrometheus "github.com/F5Networks/k8s-bigip-ctlr/pkg/prometheus"
 	. "github.com/F5Networks/k8s-bigip-ctlr/pkg/resource"
 	log "github.com/F5Networks/k8s-bigip-ctlr/pkg/vlogger"
-	v1 "k8s.io/api/core/v1"
-	"k8s.io/api/extensions/v1beta1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/kubernetes"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/apimachinery/pkg/util/wait"
-	watch "k8s.io/apimachinery/pkg/watch"
-	rest "k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/util/workqueue"
-
 	"github.com/miekg/dns"
 	routeapi "github.com/openshift/api/route/v1"
 	routeclient "github.com/openshift/client-go/route/clientset/versioned/typed/route/v1"
+	"golang.org/x/mod/semver"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/api/extensions/v1beta1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
+	watch "k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/kubernetes"
+	rest "k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 )
 
 type ResourceMap map[int32][]*ResourceConfig
@@ -65,10 +69,12 @@ type Manager struct {
 	kubeClient          kubernetes.Interface
 	restClientv1        rest.Interface
 	restClientv1beta1   rest.Interface
+	netClientv1         rest.Interface
 	routeClientV1       routeclient.RouteV1Interface
 	steadyState         bool
 	queueLen            int
 	processedItems      int
+	processedResources  map[string]bool
 	// Use internal node IPs
 	useNodeInternal bool
 	// Running in nodeport (or cluster) mode
@@ -92,6 +98,7 @@ type Manager struct {
 	// Namespace informer support (namespace labels)
 	nsQueue    workqueue.RateLimitingInterface
 	nsInformer cache.SharedIndexInformer
+	DynamicNS  bool
 	// Event notifier
 	eventNotifier *EventNotifier
 	// Route configurations
@@ -114,6 +121,7 @@ type Manager struct {
 	mergedRulesMap map[string]map[string]MergedRuleEntry
 	// Whether to watch ConfigMap resources or not
 	manageConfigMaps       bool
+	hubMode                bool
 	manageIngress          bool
 	manageIngressClassOnly bool
 	ingressClass           string
@@ -129,6 +137,8 @@ type Manager struct {
 	// Processed routes for updating Admit Status
 	agRspChan          chan interface{}
 	processAgentLabels func(map[string]string, string, string) bool
+	K8sVersion         string
+	TeemData           *teem.TeemsData
 }
 
 // Watched Namespaces for global availability.
@@ -158,6 +168,7 @@ type Params struct {
 	ManageConfigMaps       bool
 	ManageIngress          bool
 	ManageIngressClassOnly bool
+	HubMode                bool
 	IngressClass           string
 	Agent                  string
 	SchemaLocalPath        string
@@ -166,6 +177,7 @@ type Params struct {
 	DgPath             string
 	AgRspChan          chan interface{}
 	ProcessAgentLabels func(map[string]string, string, string) bool
+	UserAgent          string
 }
 
 // Configuration options for Routes in OpenShift
@@ -182,6 +194,21 @@ type SvcEndPointsCache struct {
 	members     []Member
 	labelString string
 }
+
+const (
+
+	// Kinds of Resources
+	Namespaces     = "namespaces"
+	Services       = "services"
+	Endpoints      = "endpoints"
+	Configmaps     = "configmaps"
+	Ingresses      = "ingresses"
+	Routes         = "routes"
+	Secrets        = "secrets"
+	IngressClasses = "ingressclasses"
+
+	hubModeInterval = 30 * time.Second //Hubmode ConfigMap resync interval
+)
 
 var RoutesProcessed []*routeapi.Route
 
@@ -219,6 +246,7 @@ func NewManager(params *Params) *Manager {
 		eventNotifier:          NewEventNotifier(params.broadcasterFunc),
 		mergedRulesMap:         make(map[string]map[string]MergedRuleEntry),
 		manageConfigMaps:       params.ManageConfigMaps,
+		hubMode:                params.HubMode,
 		manageIngress:          params.ManageIngress,
 		manageIngressClassOnly: params.ManageIngressClassOnly,
 		ingressClass:           params.IngressClass,
@@ -232,6 +260,7 @@ func NewManager(params *Params) *Manager {
 		agentCfgMap:            make(map[string]*AgentCfgMap),
 		agentCfgMapSvcCache:    make(map[string]*SvcEndPointsCache),
 	}
+	manager.processedResources = make(map[string]bool)
 
 	// Initialize agent response worker
 	go manager.agentResponseWorker()
@@ -243,6 +272,10 @@ func NewManager(params *Params) *Manager {
 	if nil != manager.kubeClient && nil == manager.restClientv1beta1 {
 		// This is the normal production case, but need the checks for unit tests.
 		manager.restClientv1beta1 = manager.kubeClient.ExtensionsV1beta1().RESTClient()
+	}
+	if nil != manager.kubeClient && nil == manager.netClientv1 {
+		// This is the normal production case, but need the checks for unit tests.
+		manager.netClientv1 = manager.kubeClient.NetworkingV1().RESTClient()
 	}
 	return &manager
 }
@@ -272,6 +305,7 @@ func (appMgr *Manager) addNamespaceLocked(
 	cfgMapSelector labels.Selector,
 	resyncPeriod time.Duration,
 ) (*appInformer, error) {
+	// Check if watching all namespaces by checking all appInformers is created for "" namespace
 	if appMgr.watchingAllNamespacesLocked() {
 		return nil, fmt.Errorf(
 			"Cannot add additional namespaces when already watching all.")
@@ -305,6 +339,7 @@ func (appMgr *Manager) removeNamespaceLocked(namespace string) error {
 	return nil
 }
 
+// AddNamespaceLabelInformer spins an informer to watch all namespaces with matching label
 func (appMgr *Manager) AddNamespaceLabelInformer(
 	labelSelector labels.Selector,
 	resyncPeriod time.Duration,
@@ -324,7 +359,7 @@ func (appMgr *Manager) AddNamespaceLabelInformer(
 	appMgr.nsInformer = cache.NewSharedIndexInformer(
 		cache.NewFilteredListWatchFromClient(
 			appMgr.restClientv1,
-			"namespaces",
+			Namespaces,
 			"",
 			optionsModifier,
 		),
@@ -346,6 +381,12 @@ func (appMgr *Manager) AddNamespaceLabelInformer(
 
 func (appMgr *Manager) enqueueNamespace(obj interface{}) {
 	ns := obj.(*v1.Namespace)
+	if !appMgr.DynamicNS && !appMgr.watchingAllNamespacesLocked() {
+		if _, ok := appMgr.getNamespaceInformer(ns.Name); !ok {
+			return
+		}
+	}
+
 	appMgr.nsQueue.Add(ns.ObjectMeta.Name)
 }
 
@@ -373,6 +414,47 @@ func (appMgr *Manager) processNextNamespace() bool {
 	return true
 }
 
+func (appMgr *Manager) triggerSyncResources(ns string, inf *appInformer) {
+	enqueueSvcFromNamespace := func(namespace string, appInf *appInformer) {
+		svcs := appInf.svcInformer.GetIndexer().List()
+		if svcs != nil && len(svcs) > 0 {
+			svc := svcs[0].(*v1.Service)
+			svcKey := serviceQueueKey{
+				Namespace:    namespace,
+				ServiceName:  svc.Name,
+				ResourceKind: Services,
+				ResourceName: svc.Name,
+				Operation:    OprTypeUpdate,
+			}
+			log.Debugf("[CORE] Periodic enqueue of Service from Namespace: %v", namespace)
+			appMgr.vsQueue.Add(svcKey)
+		}
+	}
+
+	if appMgr.watchingAllNamespacesLocked() {
+		namespaces := appMgr.GetWatchedNamespacesLockless()
+
+		if len(namespaces) == 1 && namespaces[0] == "" {
+			if appMgr.nsInformer == nil {
+				return
+			}
+			nsps := appMgr.nsInformer.GetIndexer().List()
+			namespaces = []string{}
+			for _, ns := range nsps {
+				namespaces = append(namespaces, ns.(*v1.Namespace).Name)
+			}
+		}
+
+		for _, ns := range namespaces {
+			if inf, ok := appMgr.getNamespaceInformerLocked(ns); ok {
+				enqueueSvcFromNamespace(ns, inf)
+			}
+		}
+	} else {
+		enqueueSvcFromNamespace(ns, inf)
+	}
+}
+
 func (appMgr *Manager) syncNamespace(nsName string) error {
 	startTime := time.Now()
 	var err error
@@ -391,6 +473,11 @@ func (appMgr *Manager) syncNamespace(nsName string) error {
 	defer appMgr.informersMutex.Unlock()
 	appInf, found := appMgr.getNamespaceInformerLocked(nsName)
 	if exists && found {
+		appMgr.triggerSyncResources(nsName, appInf)
+		return nil
+	}
+	// Skip deleting informers if watching specific namespaces
+	if !appMgr.DynamicNS {
 		return nil
 	}
 	if exists {
@@ -443,34 +530,39 @@ func (appMgr *Manager) syncNamespace(nsName string) error {
 func (appMgr *Manager) GetWatchedNamespaces() []string {
 	appMgr.informersMutex.Lock()
 	defer appMgr.informersMutex.Unlock()
+	return appMgr.GetWatchedNamespacesLockless()
+}
+
+func (appMgr *Manager) GetWatchedNamespacesLockless() []string {
 	var namespaces []string
 	for k, _ := range appMgr.appInformers {
 		namespaces = append(namespaces, k)
 	}
 	return namespaces
 }
-
 func (appMgr *Manager) GetNamespaceLabelInformer() cache.SharedIndexInformer {
 	return appMgr.nsInformer
 }
 
 type serviceQueueKey struct {
-	Namespace   string
-	ServiceName string
-	Name        string // Name of the resource
-	Operation   string
-	Data        string
+	Namespace    string
+	ServiceName  string
+	ResourceKind string
+	ResourceName string
+	Operation    string
 }
 
 type appInformer struct {
-	namespace      string
-	cfgMapInformer cache.SharedIndexInformer
-	svcInformer    cache.SharedIndexInformer
-	endptInformer  cache.SharedIndexInformer
-	ingInformer    cache.SharedIndexInformer
-	routeInformer  cache.SharedIndexInformer
-	nodeInformer   cache.SharedIndexInformer
-	stopCh         chan struct{}
+	namespace        string
+	cfgMapInformer   cache.SharedIndexInformer
+	svcInformer      cache.SharedIndexInformer
+	endptInformer    cache.SharedIndexInformer
+	ingInformer      cache.SharedIndexInformer
+	routeInformer    cache.SharedIndexInformer
+	nodeInformer     cache.SharedIndexInformer
+	secretInformer   cache.SharedIndexInformer
+	ingClassInformer cache.SharedIndexInformer
+	stopCh           chan struct{}
 }
 
 func (appMgr *Manager) newAppInformer(
@@ -488,7 +580,7 @@ func (appMgr *Manager) newAppInformer(
 		svcInformer: cache.NewSharedIndexInformer(
 			cache.NewFilteredListWatchFromClient(
 				appMgr.restClientv1,
-				"services",
+				Services,
 				namespace,
 				everything,
 			),
@@ -499,7 +591,7 @@ func (appMgr *Manager) newAppInformer(
 		endptInformer: cache.NewSharedIndexInformer(
 			cache.NewFilteredListWatchFromClient(
 				appMgr.restClientv1,
-				"endpoints",
+				Endpoints,
 				namespace,
 				everything,
 			),
@@ -507,21 +599,60 @@ func (appMgr *Manager) newAppInformer(
 			resyncPeriod,
 			cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
 		),
+		secretInformer: cache.NewSharedIndexInformer(
+			cache.NewFilteredListWatchFromClient(
+				appMgr.restClientv1,
+				Secrets,
+				namespace,
+				everything,
+			),
+			&v1.Secret{},
+			resyncPeriod,
+			cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+		),
 	}
 
 	if true == appMgr.manageIngress {
 		log.Infof("[CORE] Watching Ingress resources.")
-		appInf.ingInformer = cache.NewSharedIndexInformer(
-			cache.NewFilteredListWatchFromClient(
-				appMgr.restClientv1beta1,
-				"ingresses",
-				namespace,
-				everything,
-			),
-			&v1beta1.Ingress{},
-			resyncPeriod,
-			cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
-		)
+		// TODO Remove the version comparison once v1beta1.Ingress is deprecated in k8s 1.22
+		out := semver.Compare(appMgr.K8sVersion, "v1.19.0")
+		if out >= 0 {
+			appInf.ingInformer = cache.NewSharedIndexInformer(
+				cache.NewFilteredListWatchFromClient(
+					appMgr.netClientv1,
+					Ingresses,
+					namespace,
+					everything,
+				),
+				&netv1.Ingress{},
+				resyncPeriod,
+				cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+			)
+			appInf.ingClassInformer = cache.NewSharedIndexInformer(
+				cache.NewFilteredListWatchFromClient(
+					appMgr.netClientv1,
+					IngressClasses,
+					"",
+					everything,
+				),
+				&netv1.IngressClass{},
+				resyncPeriod,
+				cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+			)
+		} else {
+			appInf.ingInformer = cache.NewSharedIndexInformer(
+				cache.NewFilteredListWatchFromClient(
+					appMgr.restClientv1beta1,
+					Ingresses,
+					namespace,
+					everything,
+				),
+				&v1beta1.Ingress{},
+				resyncPeriod,
+				cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+			)
+		}
+
 	} else {
 		log.Infof("[CORE] Not watching Ingress resources.")
 	}
@@ -531,15 +662,20 @@ func (appMgr *Manager) newAppInformer(
 			options.LabelSelector = cfgMapSelector.String()
 		}
 		log.Infof("[CORE] Watching ConfigMap resources.")
+		//If Hubmode is enabled, process configmaps every 30 seconds to process unwatched namespace deployments
+		syncInterval := resyncPeriod
+		if appMgr.hubMode {
+			syncInterval = hubModeInterval
+		}
 		appInf.cfgMapInformer = cache.NewSharedIndexInformer(
 			cache.NewFilteredListWatchFromClient(
 				appMgr.restClientv1,
-				"configmaps",
+				Configmaps,
 				namespace,
 				cfgMapOptions,
 			),
 			&v1.ConfigMap{},
-			resyncPeriod,
+			syncInterval,
 			cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
 		)
 	} else {
@@ -553,11 +689,11 @@ func (appMgr *Manager) newAppInformer(
 			&cache.ListWatch{
 				ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
 					options.LabelSelector = appMgr.routeConfig.RouteLabel
-					return appMgr.routeClientV1.Routes(namespace).List(options)
+					return appMgr.routeClientV1.Routes(namespace).List(context.TODO(), options)
 				},
 				WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
 					options.LabelSelector = appMgr.routeConfig.RouteLabel
-					return appMgr.routeClientV1.Routes(namespace).Watch(options)
+					return appMgr.routeClientV1.Routes(namespace).Watch(context.TODO(), options)
 				},
 			},
 			&routeapi.Route{},
@@ -568,17 +704,22 @@ func (appMgr *Manager) newAppInformer(
 
 	if false != appMgr.manageConfigMaps {
 		log.Infof("[CORE] Handling ConfigMap resource events.")
+		// If Hubmode is enabled, process configmaps every 30 seconds to process unwatched namespace deployments
+		syncInterval := resyncPeriod
+		if appMgr.hubMode {
+			syncInterval = hubModeInterval
+		}
 		appInf.cfgMapInformer.AddEventHandlerWithResyncPeriod(
 			&cache.ResourceEventHandlerFuncs{
-				AddFunc: func(obj interface{}) { appMgr.enqueueCreatedConfigMap(obj) },
+				AddFunc: func(obj interface{}) { appMgr.enqueueConfigMap(obj, OprTypeCreate) },
 				UpdateFunc: func(old, cur interface{}) {
-					if !reflect.DeepEqual(old, cur) {
-						appMgr.enqueueUpdatedConfigMap(cur)
+					if appMgr.hubMode || !reflect.DeepEqual(old, cur) {
+						appMgr.enqueueConfigMap(cur, OprTypeUpdate)
 					}
 				},
-				DeleteFunc: func(obj interface{}) { appMgr.enqueueDeletedConfigMap(obj) },
+				DeleteFunc: func(obj interface{}) { appMgr.enqueueConfigMap(obj, OprTypeDelete) },
 			},
-			resyncPeriod,
+			syncInterval,
 		)
 	} else {
 		log.Infof("[CORE] Not handling ConfigMap resource events.")
@@ -586,18 +727,27 @@ func (appMgr *Manager) newAppInformer(
 
 	appInf.svcInformer.AddEventHandlerWithResyncPeriod(
 		&cache.ResourceEventHandlerFuncs{
-			AddFunc:    func(obj interface{}) { appMgr.enqueueService(obj) },
-			UpdateFunc: func(old, cur interface{}) { appMgr.enqueueService(cur) },
-			DeleteFunc: func(obj interface{}) { appMgr.enqueueService(obj) },
+			AddFunc:    func(obj interface{}) { appMgr.enqueueService(obj, OprTypeCreate) },
+			UpdateFunc: func(old, cur interface{}) { appMgr.enqueueService(cur, OprTypeUpdate) },
+			DeleteFunc: func(obj interface{}) { appMgr.enqueueService(obj, OprTypeDelete) },
 		},
 		resyncPeriod,
 	)
 
 	appInf.endptInformer.AddEventHandlerWithResyncPeriod(
 		&cache.ResourceEventHandlerFuncs{
-			AddFunc:    func(obj interface{}) { appMgr.enqueueEndpoints(obj) },
-			UpdateFunc: func(old, cur interface{}) { appMgr.enqueueEndpoints(cur) },
-			DeleteFunc: func(obj interface{}) { appMgr.enqueueEndpoints(obj) },
+			AddFunc:    func(obj interface{}) { appMgr.enqueueEndpoints(obj, OprTypeCreate) },
+			UpdateFunc: func(old, cur interface{}) { appMgr.enqueueEndpoints(cur, OprTypeUpdate) },
+			DeleteFunc: func(obj interface{}) { appMgr.enqueueEndpoints(obj, OprTypeDelete) },
+		},
+		resyncPeriod,
+	)
+	appInf.secretInformer.AddEventHandlerWithResyncPeriod(
+		&cache.ResourceEventHandlerFuncs{
+			// Making all operation types as update because each change in secret will update the ingress/configmap
+			AddFunc:    func(obj interface{}) { appMgr.enqueueSecrets(obj, OprTypeUpdate) },
+			UpdateFunc: func(old, cur interface{}) { appMgr.enqueueSecrets(cur, OprTypeUpdate) },
+			DeleteFunc: func(obj interface{}) { appMgr.enqueueSecrets(obj, OprTypeUpdate) },
 		},
 		resyncPeriod,
 	)
@@ -606,12 +756,24 @@ func (appMgr *Manager) newAppInformer(
 		log.Infof("[CORE] Handling Ingress resource events.")
 		appInf.ingInformer.AddEventHandlerWithResyncPeriod(
 			&cache.ResourceEventHandlerFuncs{
-				AddFunc:    func(obj interface{}) { appMgr.enqueueIngress(obj) },
-				UpdateFunc: func(old, cur interface{}) { appMgr.enqueueIngress(cur) },
-				DeleteFunc: func(obj interface{}) { appMgr.enqueueIngress(obj) },
+				AddFunc:    func(obj interface{}) { appMgr.enqueueIngress(obj, OprTypeCreate) },
+				UpdateFunc: func(old, cur interface{}) { appMgr.enqueueIngress(cur, OprTypeUpdate) },
+				DeleteFunc: func(obj interface{}) { appMgr.enqueueIngress(obj, OprTypeDelete) },
 			},
 			resyncPeriod,
 		)
+		// TODO Remove the version comparison once v1beta1.Ingress is deprecated in k8s 1.22
+		out := semver.Compare(appMgr.K8sVersion, "v1.19.0")
+		if out >= 0 {
+			appInf.ingClassInformer.AddEventHandlerWithResyncPeriod(
+				&cache.ResourceEventHandlerFuncs{
+					//AddFunc:    func(obj interface{}) { appMgr.enqueueIngress(obj, OprTypeCreate) },
+					//UpdateFunc: func(old, cur interface{}) { appMgr.enqueueIngress(cur, OprTypeUpdate) },
+					//DeleteFunc: func(obj interface{}) { appMgr.enqueueIngress(obj, OprTypeDelete) },
+				},
+				resyncPeriod,
+			)
+		}
 	} else {
 		log.Infof("[CORE] Not handling Ingress resource events.")
 	}
@@ -619,9 +781,9 @@ func (appMgr *Manager) newAppInformer(
 	if nil != appMgr.routeClientV1 {
 		appInf.routeInformer.AddEventHandlerWithResyncPeriod(
 			&cache.ResourceEventHandlerFuncs{
-				AddFunc:    func(obj interface{}) { appMgr.enqueueRoute(obj) },
-				UpdateFunc: func(old, cur interface{}) { appMgr.enqueueRoute(cur) },
-				DeleteFunc: func(obj interface{}) { appMgr.enqueueRoute(obj) },
+				AddFunc:    func(obj interface{}) { appMgr.enqueueRoute(obj, OprTypeCreate) },
+				UpdateFunc: func(old, cur interface{}) { appMgr.enqueueRoute(cur, OprTypeUpdate) },
+				DeleteFunc: func(obj interface{}) { appMgr.enqueueRoute(obj, OprTypeDelete) },
 			},
 			resyncPeriod,
 		)
@@ -630,57 +792,56 @@ func (appMgr *Manager) newAppInformer(
 	return &appInf
 }
 
-func (appMgr *Manager) enqueueCreatedConfigMap(obj interface{}) {
-	if ok, keys := appMgr.checkValidConfigMap(obj, OprTypeCreate); ok {
+func (appMgr *Manager) enqueueConfigMap(obj interface{}, operation string) {
+	if ok, keys := appMgr.checkValidConfigMap(obj, operation); ok {
 		for _, key := range keys {
+			key.Operation = operation
 			appMgr.vsQueue.Add(*key)
 		}
 	}
 }
 
-func (appMgr *Manager) enqueueUpdatedConfigMap(obj interface{}) {
-	if ok, keys := appMgr.checkValidConfigMap(obj, OprTypeModify); ok {
-		for _, key := range keys {
-			appMgr.vsQueue.Add(*key)
-		}
-	}
-}
-
-func (appMgr *Manager) enqueueDeletedConfigMap(obj interface{}) {
-	if ok, keys := appMgr.checkValidConfigMap(obj, OprTypeDelete); ok {
-		for _, key := range keys {
-			appMgr.vsQueue.Add(*key)
-		}
-	}
-}
-
-func (appMgr *Manager) enqueueService(obj interface{}) {
+func (appMgr *Manager) enqueueService(obj interface{}, operation string) {
 	if ok, keys := appMgr.checkValidService(obj); ok {
 		for _, key := range keys {
+			key.Operation = operation
 			appMgr.vsQueue.Add(*key)
 		}
 	}
 }
 
-func (appMgr *Manager) enqueueEndpoints(obj interface{}) {
+func (appMgr *Manager) enqueueEndpoints(obj interface{}, operation string) {
 	if ok, keys := appMgr.checkValidEndpoints(obj); ok {
 		for _, key := range keys {
+			key.Operation = operation
 			appMgr.vsQueue.Add(*key)
 		}
 	}
 }
 
-func (appMgr *Manager) enqueueIngress(obj interface{}) {
+func (appMgr *Manager) enqueueSecrets(obj interface{}, operation string) {
+	if ok, keys := appMgr.checkValidSecrets(obj); ok {
+		for _, key := range keys {
+			key.Operation = operation
+			appMgr.vsQueue.Add(*key)
+		}
+	}
+
+}
+
+func (appMgr *Manager) enqueueIngress(obj interface{}, operation string) {
 	if ok, keys := appMgr.checkValidIngress(obj); ok {
 		for _, key := range keys {
+			key.Operation = operation
 			appMgr.vsQueue.Add(*key)
 		}
 	}
 }
 
-func (appMgr *Manager) enqueueRoute(obj interface{}) {
+func (appMgr *Manager) enqueueRoute(obj interface{}, operation string) {
 	if ok, keys := appMgr.checkValidRoute(obj); ok {
 		for _, key := range keys {
+			key.Operation = operation
 			appMgr.vsQueue.Add(*key)
 		}
 	}
@@ -713,6 +874,9 @@ func (appInf *appInformer) start() {
 	if nil != appInf.endptInformer {
 		go appInf.endptInformer.Run(appInf.stopCh)
 	}
+	if nil != appInf.secretInformer {
+		go appInf.secretInformer.Run(appInf.stopCh)
+	}
 	if nil != appInf.ingInformer {
 		go appInf.ingInformer.Run(appInf.stopCh)
 	}
@@ -725,6 +889,9 @@ func (appInf *appInformer) start() {
 	if nil != appInf.nodeInformer {
 		go appInf.nodeInformer.Run(appInf.stopCh)
 	}
+	if nil != appInf.ingClassInformer {
+		go appInf.ingClassInformer.Run(appInf.stopCh)
+	}
 }
 
 func (appInf *appInformer) waitForCacheSync() {
@@ -735,6 +902,9 @@ func (appInf *appInformer) waitForCacheSync() {
 	}
 	if nil != appInf.endptInformer {
 		cacheSyncs = append(cacheSyncs, appInf.endptInformer.HasSynced)
+	}
+	if nil != appInf.secretInformer {
+		cacheSyncs = append(cacheSyncs, appInf.secretInformer.HasSynced)
 	}
 	if nil != appInf.ingInformer {
 		cacheSyncs = append(cacheSyncs, appInf.ingInformer.HasSynced)
@@ -747,6 +917,9 @@ func (appInf *appInformer) waitForCacheSync() {
 	}
 	if nil != appInf.nodeInformer {
 		cacheSyncs = append(cacheSyncs, appInf.nodeInformer.HasSynced)
+	}
+	if nil != appInf.ingClassInformer {
+		cacheSyncs = append(cacheSyncs, appInf.ingClassInformer.HasSynced)
 	}
 	cache.WaitForCacheSync(
 		appInf.stopCh,
@@ -854,7 +1027,7 @@ func (appMgr *Manager) GetAllWatchedNamespaces() []string {
 		NsListOptions := metav1.ListOptions{
 			LabelSelector: appMgr.WatchedNS.NamespaceLabel,
 		}
-		nsL, err := appMgr.kubeClient.CoreV1().Namespaces().List(NsListOptions)
+		nsL, err := appMgr.kubeClient.CoreV1().Namespaces().List(context.TODO(), NsListOptions)
 		if err != nil {
 			log.Errorf("[CORE] Error getting Namespaces with Namespace label - %v.", err)
 		}
@@ -871,7 +1044,7 @@ func (appMgr *Manager) GetAllWatchedNamespaces() []string {
 func (appMgr *Manager) getServiceCount() int {
 	qLen := 0
 	for _, ns := range appMgr.GetAllWatchedNamespaces() {
-		services, err := appMgr.kubeClient.CoreV1().Services(ns).List(metav1.ListOptions{})
+		services, err := appMgr.kubeClient.CoreV1().Services(ns).List(context.TODO(), metav1.ListOptions{})
 		qLen += len(services.Items)
 		if err != nil {
 			log.Errorf("[CORE] Failed getting Services from watched namespace : %v.", err)
@@ -893,8 +1066,16 @@ func (appMgr *Manager) processNextVirtualServer() bool {
 	}
 
 	defer appMgr.vsQueue.Done(key)
+	skey := key.(serviceQueueKey)
+	if !appMgr.steadyState && (skey.ResourceKind != Services && skey.ResourceKind != Configmaps && skey.ResourceKind != Routes) {
+		if skey.Operation != OprTypeCreate {
+			appMgr.vsQueue.AddRateLimited(key)
+		}
+		appMgr.vsQueue.Forget(key)
+		return true
+	}
 
-	err := appMgr.syncVirtualServer(key.(serviceQueueKey))
+	err := appMgr.syncVirtualServer(skey)
 	if err == nil {
 		if !appMgr.steadyState {
 			appMgr.processedItems++
@@ -935,8 +1116,8 @@ func (appMgr *Manager) syncVirtualServer(sKey serviceQueueKey) error {
 	startTime := time.Now()
 	defer func() {
 		endTime := time.Now()
-		log.Debugf("[CORE] Finished syncing virtual servers %+v in namespace %+v (%v)",
-			sKey.ServiceName, sKey.Namespace, endTime.Sub(startTime))
+		log.Debugf("[CORE] Finished syncing virtual servers %+v in namespace %+v (%v), %v/%v",
+			sKey.ServiceName, sKey.Namespace, endTime.Sub(startTime), appMgr.processedItems, appMgr.queueLen)
 	}()
 	// Get the informers for the namespace. This will tell us if we care about
 	// this item.
@@ -957,6 +1138,38 @@ func (appMgr *Manager) syncVirtualServer(sKey serviceQueueKey) error {
 		// Returning non-nil err will re-queue this item with rate-limiting.
 		log.Warningf("[CORE] Error looking up service '%v': %v\n", svcKey, err)
 		return err
+	}
+
+	// Processing just one service from a namespace processes all the resources in that namespace
+	if sKey.ResourceKind == Services {
+		rkey := Services + "_" + sKey.Namespace
+		if !appMgr.steadyState && sKey.Operation == OprTypeCreate {
+			if _, ok := appMgr.processedResources[rkey]; ok {
+				if !appMgr.steadyState && appMgr.processedItems >= appMgr.queueLen-1 {
+					appMgr.deployResource()
+					appMgr.steadyState = true
+				}
+				return nil
+			}
+			appMgr.processedResources[rkey] = true
+		}
+	} else if sKey.ResourceKind == Endpoints && appMgr.IsNodePort() {
+		return nil
+	} else {
+		// Resources other than Services will be tracked if they are processed earlier
+		resKey := prepareResourceKey(sKey.ResourceKind, sKey.Namespace, sKey.ResourceName)
+		switch sKey.Operation {
+		// If a resource is processed earlier and still sKey gives us CREATE event,
+		// then it was handled earlier when associated service processed
+		// otherwise just mark it as processed and continue
+		case OprTypeCreate:
+			if _, ok := appMgr.processedResources[resKey]; ok {
+				return nil
+			}
+			appMgr.processedResources[resKey] = true
+		case OprTypeDelete:
+			delete(appMgr.processedResources, resKey)
+		}
 	}
 
 	// Use a map to allow ports in the service to be looked up quickly while
@@ -1019,9 +1232,9 @@ func (appMgr *Manager) syncVirtualServer(sKey serviceQueueKey) error {
 
 	switch {
 	case stats.isStatsAvailable(),
-		!appMgr.steadyState && appMgr.processedItems >= appMgr.queueLen:
+		!appMgr.steadyState && appMgr.processedItems >= appMgr.queueLen-1:
 		{
-			if appMgr.processedItems >= appMgr.queueLen || appMgr.steadyState {
+			if appMgr.processedItems >= appMgr.queueLen-1 || appMgr.steadyState {
 				appMgr.deployResource()
 				appMgr.steadyState = true
 			}
@@ -1042,8 +1255,8 @@ func (appMgr *Manager) syncConfigMaps(
 
 	// Handle delete cfgMap Operation for Agent
 	if appMgr.AgentCIS.IsImplInAgent(ResourceTypeCfgMap) {
-		key := sKey.Namespace + "/" + sKey.Name
-		if sKey.Operation == OprTypeDelete {
+		key := sKey.Namespace + "/" + sKey.ResourceName
+		if sKey.Operation == OprTypeDelete && sKey.ResourceKind == Configmaps {
 			appMgr.agentCfgMap[key].Operation = OprTypeDelete
 			stats.vsDeleted += 1
 			return nil
@@ -1100,7 +1313,9 @@ func (appMgr *Manager) syncConfigMaps(
 			sKey.Namespace, err)
 		return err
 	}
-
+	appMgr.TeemData.Lock()
+	appMgr.TeemData.ResourceType.Configmaps[sKey.Namespace] = len(cfgMapsByIndex)
+	appMgr.TeemData.Unlock()
 	for _, obj := range cfgMapsByIndex {
 		// We need to look at all config maps in the store, parse the data blob,
 		// and see if it belongs to the service that has changed.
@@ -1109,6 +1324,10 @@ func (appMgr *Manager) syncConfigMaps(
 		if cm.ObjectMeta.Namespace != sKey.Namespace {
 			continue
 		}
+
+		// Mark each resource as it is already processed
+		// So that later the create event of the same resource will not processed, unnecessarily
+		appMgr.processedResources[prepareResourceKey(Configmaps, sKey.Namespace, cm.Name)] = true
 
 		if appMgr.AgentCIS.IsImplInAgent(ResourceTypeCfgMap) {
 			//ignore invalid as3 configmaps if found.
@@ -1123,7 +1342,7 @@ func (appMgr *Manager) syncConfigMaps(
 				agntCfgMap.Init(cm.Name, cm.Namespace, cm.Data["template"], cm.Labels, appMgr.getEndpoints)
 				key := cm.Namespace + "/" + cm.Name
 				if cfgMap, ok := appMgr.agentCfgMap[key]; ok {
-					if cfgMap.Data != cm.Data["template"] || cm.Labels["as3"] != cfgMap.Label["as3"] || cm.Labels["overrideAS3"] != cfgMap.Label["overrideAS3"] {
+					if appMgr.hubMode || cfgMap.Data != cm.Data["template"] || cm.Labels["as3"] != cfgMap.Label["as3"] || cm.Labels["overrideAS3"] != cfgMap.Label["overrideAS3"] {
 						appMgr.agentCfgMap[key] = agntCfgMap
 						stats.vsUpdated += 1
 					}
@@ -1156,7 +1375,7 @@ func (appMgr *Manager) syncConfigMaps(
 				}
 				// Check if profile is contained in a Secret
 				secret, err := appMgr.kubeClient.CoreV1().Secrets(cm.ObjectMeta.Namespace).
-					Get(profile.Name, metav1.GetOptions{})
+					Get(context.TODO(), profile.Name, metav1.GetOptions{})
 				if err != nil {
 					// No secret, so we assume the profile is a BIG-IP default
 					log.Debugf("[CORE] No Secret with name '%s' in namespace '%s', "+
@@ -1200,6 +1419,7 @@ func (appMgr *Manager) syncConfigMaps(
 	return nil
 }
 
+// TODO remove the function once v1beta1.Ingress is deprecated in k8s 1.22
 func prepareIngressSSLContext(appMgr *Manager, ing *v1beta1.Ingress) {
 	// Prepare Ingress SSL Transient Context
 	for _, tls := range ing.Spec.TLS {
@@ -1209,7 +1429,7 @@ func prepareIngressSSLContext(appMgr *Manager, ing *v1beta1.Ingress) {
 		}
 		// Check if profile is contained in a Secret
 		secret, err := appMgr.kubeClient.CoreV1().Secrets(ing.ObjectMeta.Namespace).
-			Get(tls.SecretName, metav1.GetOptions{})
+			Get(context.TODO(), tls.SecretName, metav1.GetOptions{})
 		if err != nil {
 			appMgr.rsrcSSLCtxt[tls.SecretName] = nil
 			continue
@@ -1234,180 +1454,341 @@ func (appMgr *Manager) syncIngresses(
 			sKey.Namespace, err)
 		return err
 	}
+	appMgr.TeemData.Lock()
+	appMgr.TeemData.ResourceType.Ingresses[sKey.Namespace] = len(ingByIndex)
+	appMgr.TeemData.Unlock()
 	svcFwdRulesMap := NewServiceFwdRuleMap()
 	for _, obj := range ingByIndex {
 		// We need to look at all ingresses in the store, parse the data blob,
-		// and see if it belongs to the service that has changed.
-		ing := obj.(*v1beta1.Ingress)
-		// TODO: Each ingress resource must be processed for its associated service
-		//  only, existing implementation processes all services available in k8s
-		//  and this approach degrades the performance of processing Ingress resources
-		if ing.ObjectMeta.Namespace != sKey.Namespace {
-			continue
-		}
-
-		if appMgr.useSecrets {
-			prepareIngressSSLContext(appMgr, ing)
-		}
-
-		// Resolve first Ingress Host name (if required)
-		_, exists := ing.ObjectMeta.Annotations[F5VsBindAddrAnnotation]
-		if !exists && appMgr.resolveIng != "" {
-			appMgr.resolveIngressHost(ing, sKey.Namespace)
-		}
-
-		// Get a list of dependencies removed so their pools can be removed.
-		objKey, objDeps := NewObjectDependencies(ing)
-		svcDepKey := ObjectDependency{
-			Kind:      ServiceDep,
-			Namespace: sKey.Namespace,
-			Name:      sKey.ServiceName,
-		}
-		ingressLookupFunc := func(key ObjectDependency) bool {
-			if key.Kind != "Ingress" {
-				return false
-			}
-			ingKey := key.Namespace + "/" + key.Name
-			_, ingFound, _ := appInf.ingInformer.GetIndexer().GetByKey(ingKey)
-			return !ingFound
-		}
-		depsAdded, depsRemoved := appMgr.resources.UpdateDependencies(
-			objKey, objDeps, svcDepKey, ingressLookupFunc)
-
-		portStructs := appMgr.virtualPorts(ing)
-		for _, portStruct := range portStructs {
-			rsCfg := appMgr.createRSConfigFromIngress(
-				ing,
-				appMgr.resources,
-				sKey.Namespace,
-				appInf.svcInformer.GetIndexer(),
-				portStruct,
-				appMgr.defaultIngIP,
-				appMgr.vsSnatPoolName,
-			)
-			if rsCfg == nil {
-				// Currently, an error is returned only if the Ingress is one we
-				// do not care about
+		// and process ingresses that has changed.
+		//TODO remove the switch case and checkV1beta1Ingress function
+		switch obj.(type) {
+		case *v1beta1.Ingress:
+			ing := obj.(*v1beta1.Ingress)
+			// TODO: Each ingress resource must be processed for its associated service
+			//  only, existing implementation processes all services available in k8s
+			//  and this approach degrades the performance of processing Ingress resources
+			if ing.ObjectMeta.Namespace != sKey.Namespace {
 				continue
 			}
-
-			// Handle TLS configuration
-			updated := appMgr.handleIngressTls(rsCfg, ing, svcFwdRulesMap)
-			if updated {
-				stats.cpUpdated += 1
+			if ok := appMgr.checkV1Beta1SingleServivceIngress(ing); !ok {
+				continue
 			}
+			if appMgr.useSecrets {
+				prepareIngressSSLContext(appMgr, ing)
+			}
+			// Resolve first Ingress Host name (if required)
+			_, exists := ing.ObjectMeta.Annotations[F5VsBindAddrAnnotation]
+			if !exists && appMgr.resolveIng != "" {
+				appMgr.resolveIngressHost(ing, sKey.Namespace)
+			}
+			// Get a list of dependencies removed so their pools can be removed.
+			objKey, objDeps := NewObjectDependencies(ing)
+			svcDepKey := ObjectDependency{
+				Kind:      ServiceDep,
+				Namespace: sKey.Namespace,
+				Name:      sKey.ServiceName,
+			}
+			ingressLookupFunc := func(key ObjectDependency) bool {
+				if key.Kind != "Ingress" {
+					return false
+				}
+				ingKey := key.Namespace + "/" + key.Name
+				_, ingFound, _ := appInf.ingInformer.GetIndexer().GetByKey(ingKey)
+				return !ingFound
+			}
+			// Mark each resource as it is already processed
+			// So that later the create event of the same resource will not processed, unnecessarily
+			appMgr.processedResources[prepareResourceKey(Ingresses, sKey.Namespace, ing.Name)] = true
+			depsAdded, depsRemoved := appMgr.resources.UpdateDependencies(
+				objKey, objDeps, svcDepKey, ingressLookupFunc)
+			portStructs := appMgr.virtualPorts(ing)
+			for i, portStruct := range portStructs {
+				rsCfg := appMgr.createRSConfigFromIngress(
+					ing,
+					appMgr.resources,
+					sKey.Namespace,
+					appInf.svcInformer.GetIndexer(),
+					portStruct,
+					appMgr.defaultIngIP,
+					appMgr.vsSnatPoolName,
+				)
+				if rsCfg == nil {
+					// Currently, an error is returned only if the Ingress is one we
+					// do not care about
+					continue
+				}
 
-			// Handle Ingress health monitors
-			rsName := rsCfg.GetName()
-			hmStr, found := ing.ObjectMeta.Annotations[HealthMonitorAnnotation]
-			if found {
-				var monitors AnnotationHealthMonitors
-				err := json.Unmarshal([]byte(hmStr), &monitors)
-				if err != nil {
-					msg := fmt.Sprintf(
-						"Unable to parse health monitor JSON array '%v': %v", hmStr, err)
-					log.Errorf("[CORE] %s", msg)
-					appMgr.recordIngressEvent(ing, "InvalidData", msg)
-				} else {
-					if nil != ing.Spec.Backend {
-						fullPoolName := fmt.Sprintf("/%s/%s", rsCfg.Virtual.Partition,
-							FormatIngressPoolName(sKey.Namespace, sKey.ServiceName))
-						appMgr.handleSingleServiceHealthMonitors(
-							rsName, fullPoolName, rsCfg, ing, monitors)
+				// Handle TLS configuration
+				updated := appMgr.handleIngressTls(rsCfg, ing, svcFwdRulesMap)
+				if updated {
+					stats.cpUpdated += 1
+				}
+
+				// Handle Ingress health monitors
+				rsName := rsCfg.GetName()
+				hmStr, found := ing.ObjectMeta.Annotations[HealthMonitorAnnotation]
+				if found {
+					var monitors AnnotationHealthMonitors
+					err := json.Unmarshal([]byte(hmStr), &monitors)
+					if err != nil {
+						msg := fmt.Sprintf(
+							"Unable to parse health monitor JSON array '%v': %v", hmStr, err)
+						log.Errorf("[CORE] %s", msg)
+						appMgr.recordIngressEvent(ing, "InvalidData", msg)
 					} else {
-						appMgr.handleMultiServiceHealthMonitors(
-							rsName, rsCfg, ing, monitors)
-					}
-				}
-				rsCfg.SortMonitors()
-			}
-			// Collect all service names on this Ingress.
-			// Used in handleConfigForType.
-			var svcs []string
-			if nil != ing.Spec.Rules { // multi-service
-				for _, rl := range ing.Spec.Rules {
-					if nil != rl.IngressRuleValue.HTTP {
-						for _, pth := range rl.IngressRuleValue.HTTP.Paths {
-							svcs = append(svcs, pth.Backend.ServiceName)
+						if nil != ing.Spec.Backend {
+							fullPoolName := fmt.Sprintf("/%s/%s", rsCfg.Virtual.Partition,
+								FormatIngressPoolName(sKey.Namespace, sKey.ServiceName))
+							appMgr.handleSingleServiceHealthMonitors(
+								rsName, fullPoolName, rsCfg, ing, monitors)
+						} else {
+							appMgr.handleMultiServiceHealthMonitors(
+								rsName, rsCfg, ing, monitors)
 						}
 					}
+					rsCfg.SortMonitors()
 				}
-			} else { // single-service
-				svcs = append(svcs, ing.Spec.Backend.ServiceName)
-			}
-
-			// Remove any dependencies no longer used by this Ingress
-			for _, dep := range depsRemoved {
-				if dep.Kind == ServiceDep {
-					cfgChanged, svcKey := rsCfg.RemovePool(
-						dep.Namespace, FormatIngressPoolName(dep.Namespace, dep.Name), appMgr.mergedRulesMap)
-					if cfgChanged {
-						stats.poolsUpdated++
-					}
-					if nil != svcKey {
-						appMgr.resources.DeleteKeyRef(*svcKey, rsName)
-					}
-				}
-				if dep.Kind == RuleDep {
-					for _, pol := range rsCfg.Policies {
-						for _, rl := range pol.Rules {
-							if rl.FullURI == dep.Name {
-								rsCfg.DeleteRuleFromPolicy(pol.Name, rl, appMgr.mergedRulesMap)
-							}
+				// Collect all service names on this Ingress.
+				// Used in handleConfigForType.
+				svcs := getIngressBackend(ing)
+				// Remove any dependencies no longer used by this Ingress
+				for _, dep := range depsRemoved {
+					if dep.Kind == ServiceDep {
+						cfgChanged, svcKey := rsCfg.RemovePool(
+							dep.Namespace, FormatIngressPoolName(dep.Namespace, dep.Name), appMgr.mergedRulesMap)
+						if cfgChanged {
+							stats.poolsUpdated++
+						}
+						if nil != svcKey {
+							appMgr.resources.DeleteKeyRef(*svcKey, rsName)
 						}
 					}
-				}
-				if dep.Kind == URLDep || dep.Kind == AppRootDep {
-					var addedRules string
-					for _, add := range depsAdded {
-						if add.Kind == URLDep || add.Kind == AppRootDep {
-							addedRules = add.Name
-						}
-					}
-					removedRules := strings.Split(dep.Name, ",")
-					for _, remv := range removedRules {
-						if !strings.Contains(addedRules, remv) {
-							// Rule has been removed from annotation, delete it
-							var found bool
-							for _, pol := range rsCfg.Policies {
-								for _, rl := range pol.Rules {
-									if rl.Name == remv {
-										found = true
-										rsCfg.DeleteRuleFromPolicy(pol.Name, rl, appMgr.mergedRulesMap)
-										break
-									}
+					if dep.Kind == RuleDep {
+						for _, pol := range rsCfg.Policies {
+							for _, rl := range pol.Rules {
+								if rl.FullURI == dep.Name {
+									rsCfg.DeleteRuleFromPolicy(pol.Name, rl, appMgr.mergedRulesMap)
 								}
 							}
-							if !found { // likely a merged rule
-								rsCfg.UnmergeRule(remv, appMgr.mergedRulesMap)
+						}
+					}
+					if dep.Kind == URLDep || dep.Kind == AppRootDep {
+						var addedRules string
+						for _, add := range depsAdded {
+							if add.Kind == URLDep || add.Kind == AppRootDep {
+								addedRules = add.Name
+							}
+						}
+						removedRules := strings.Split(dep.Name, ",")
+						for _, remv := range removedRules {
+							if !strings.Contains(addedRules, remv) {
+								// Rule has been removed from annotation, delete it
+								var found bool
+								for _, pol := range rsCfg.Policies {
+									for _, rl := range pol.Rules {
+										if rl.Name == remv {
+											found = true
+											rsCfg.DeleteRuleFromPolicy(pol.Name, rl, appMgr.mergedRulesMap)
+											break
+										}
+									}
+								}
+								if !found { // likely a merged rule
+									rsCfg.UnmergeRule(remv, appMgr.mergedRulesMap)
+								}
 							}
 						}
 					}
 				}
+				if ok, found, updated := appMgr.handleConfigForTypeIngress(
+					rsCfg, sKey, rsMap, rsName, svcPortMap,
+					svc, appInf, svcs, obj); !ok {
+					stats.vsUpdated += updated
+					continue
+				} else {
+					stats.vsFound += found
+					stats.vsUpdated += updated
+					if updated > 0 {
+						msg := fmt.Sprintf(
+							"Created a ResourceConfig '%v' for the Ingress.",
+							rsCfg.GetName())
+						appMgr.recordIngressEvent(ing, "ResourceConfigured", msg)
+					}
+				}
+				if i < len(portStructs)-1 {
+					//ingress ip is same for rscfg even for different port structs.
+					//Process only once.
+					continue
+				}
+				// Set the Ingress Status IP address
+				appMgr.setIngressStatus(ing, rsCfg, appInf)
+			}
+		default:
+			ing := obj.(*netv1.Ingress)
+			// TODO: Each ingress resource must be processed for its associated service
+			//  only, existing implementation processes all services available in k8s
+			//  and this approach degrades the performance of processing Ingress resources
+			if ing.ObjectMeta.Namespace != sKey.Namespace {
+				continue
+			}
+			if ok := appMgr.checkV1SingleServivceIngress(ing); !ok {
+				continue
+			}
+			if len(ing.Spec.TLS) > 0 || len(ing.ObjectMeta.Annotations[F5ClientSslProfileAnnotation]) > 0 {
+				prepareV1IngressSSLContext(appMgr, ing)
+			}
+			// Resolve first Ingress Host name (if required)
+			_, exists := ing.ObjectMeta.Annotations[F5VsBindAddrAnnotation]
+			if !exists && appMgr.resolveIng != "" {
+				appMgr.resolveV1IngressHost(ing, sKey.Namespace)
+			}
+			// Get a list of dependencies removed so their pools can be removed.
+			objKey, objDeps := NewObjectDependencies(ing)
+			svcDepKey := ObjectDependency{
+				Kind:      ServiceDep,
+				Namespace: sKey.Namespace,
+				Name:      sKey.ServiceName,
+			}
+			ingressLookupFunc := func(key ObjectDependency) bool {
+				if key.Kind != "Ingress" {
+					return false
+				}
+				ingKey := key.Namespace + "/" + key.Name
+				_, ingFound, _ := appInf.ingInformer.GetIndexer().GetByKey(ingKey)
+				return !ingFound
+			}
+			// Mark each resource as it is already processed
+			// So that later the create event of the same resource will not processed, unnecessarily
+			appMgr.processedResources[prepareResourceKey(Ingresses, sKey.Namespace, ing.Name)] = true
+			depsAdded, depsRemoved := appMgr.resources.UpdateDependencies(
+				objKey, objDeps, svcDepKey, ingressLookupFunc)
+			portStructs := appMgr.v1VirtualPorts(ing)
+			for i, portStruct := range portStructs {
+				rsCfg := appMgr.createRSConfigFromV1Ingress(
+					ing,
+					appMgr.resources,
+					sKey.Namespace,
+					appInf.svcInformer.GetIndexer(),
+					portStruct,
+					appMgr.defaultIngIP,
+					appMgr.vsSnatPoolName,
+				)
+				if rsCfg == nil {
+					// Currently, an error is returned only if the Ingress is one we
+					// do not care about
+					continue
+				}
+
+				// Handle TLS configuration
+				updated := appMgr.handleV1IngressTls(rsCfg, ing, svcFwdRulesMap)
+				if updated {
+					stats.cpUpdated += 1
+				}
+
+				// Handle Ingress health monitors
+				rsName := rsCfg.GetName()
+				hmStr, found := ing.ObjectMeta.Annotations[HealthMonitorAnnotation]
+				if found {
+					var monitors AnnotationHealthMonitors
+					err := json.Unmarshal([]byte(hmStr), &monitors)
+					if err != nil {
+						msg := fmt.Sprintf(
+							"Unable to parse health monitor JSON array '%v': %v", hmStr, err)
+						log.Errorf("[CORE] %s", msg)
+						appMgr.recordV1IngressEvent(ing, "InvalidData", msg)
+					} else {
+						if nil != ing.Spec.DefaultBackend {
+							fullPoolName := fmt.Sprintf("/%s/%s", rsCfg.Virtual.Partition,
+								FormatIngressPoolName(sKey.Namespace, sKey.ServiceName))
+							appMgr.handleSingleServiceV1IngressHealthMonitors(
+								rsName, fullPoolName, rsCfg, ing, monitors)
+						} else {
+							appMgr.handleMultiServiceV1IngressHealthMonitors(
+								rsName, rsCfg, ing, monitors)
+						}
+					}
+					rsCfg.SortMonitors()
+				}
+				// Collect all service names on this Ingress.
+				// Used in handleConfigForType.
+				svcs := getIngressV1Backend(ing)
+				// Remove any dependencies no longer used by this Ingress
+				for _, dep := range depsRemoved {
+					if dep.Kind == ServiceDep {
+						cfgChanged, svcKey := rsCfg.RemovePool(
+							dep.Namespace, FormatIngressPoolName(dep.Namespace, dep.Name), appMgr.mergedRulesMap)
+						if cfgChanged {
+							stats.poolsUpdated++
+						}
+						if nil != svcKey {
+							appMgr.resources.DeleteKeyRef(*svcKey, rsName)
+						}
+					}
+					if dep.Kind == RuleDep {
+						for _, pol := range rsCfg.Policies {
+							for _, rl := range pol.Rules {
+								if rl.FullURI == dep.Name {
+									rsCfg.DeleteRuleFromPolicy(pol.Name, rl, appMgr.mergedRulesMap)
+								}
+							}
+						}
+					}
+					if dep.Kind == URLDep || dep.Kind == AppRootDep {
+						var addedRules string
+						for _, add := range depsAdded {
+							if add.Kind == URLDep || add.Kind == AppRootDep {
+								addedRules = add.Name
+							}
+						}
+						removedRules := strings.Split(dep.Name, ",")
+						for _, remv := range removedRules {
+							if !strings.Contains(addedRules, remv) {
+								// Rule has been removed from annotation, delete it
+								var found bool
+								for _, pol := range rsCfg.Policies {
+									for _, rl := range pol.Rules {
+										if rl.Name == remv {
+											found = true
+											rsCfg.DeleteRuleFromPolicy(pol.Name, rl, appMgr.mergedRulesMap)
+											break
+										}
+									}
+								}
+								if !found { // likely a merged rule
+									rsCfg.UnmergeRule(remv, appMgr.mergedRulesMap)
+								}
+							}
+						}
+					}
+				}
+
+				if ok, found, updated := appMgr.handleConfigForTypeIngress(
+					rsCfg, sKey, rsMap, rsName, svcPortMap,
+					svc, appInf, svcs, obj); !ok {
+					stats.vsUpdated += updated
+					continue
+				} else {
+					stats.vsFound += found
+					stats.vsUpdated += updated
+					if updated > 0 {
+						msg := fmt.Sprintf(
+							"Created a ResourceConfig '%v' for the Ingress.",
+							rsCfg.GetName())
+						appMgr.recordV1IngressEvent(ing, "ResourceConfigured", msg)
+					}
+				}
+				if i < len(portStructs)-1 {
+					//ingress ip is same for rscfg even for different port structs.
+					//Process only once.
+					continue
+				}
+				// Set the Ingress Status IP address
+				appMgr.setV1IngressStatus(ing, rsCfg, appInf)
 			}
 
-			if ok, found, updated := appMgr.handleConfigForType(
-				rsCfg, sKey, rsMap, rsName, svcPortMap,
-				svc, appInf, svcs, ing); !ok {
-				stats.vsUpdated += updated
-				continue
-			} else {
-				if updated > 0 && !appMgr.processAllMultiSvc(len(rsCfg.Pools),
-					rsCfg.GetName()) {
-					updated -= 1
-				}
-				stats.vsFound += found
-				stats.vsUpdated += updated
-				if updated > 0 {
-					msg := fmt.Sprintf(
-						"Created a ResourceConfig '%v' for the Ingress.",
-						rsCfg.GetName())
-					appMgr.recordIngressEvent(ing, "ResourceConfigured", msg)
-				}
-			}
-			// Set the Ingress Status IP address
-			appMgr.setIngressStatus(ing, rsCfg)
 		}
+
 	}
 	if len(svcFwdRulesMap) > 0 {
 		httpsRedirectDg := NameRef{
@@ -1438,7 +1819,9 @@ func (appMgr *Manager) syncRoutes(
 			sKey.Namespace, err)
 		return err
 	}
-
+	appMgr.TeemData.Lock()
+	appMgr.TeemData.ResourceType.Routes[sKey.Namespace] = len(routeByIndex)
+	appMgr.TeemData.Unlock()
 	// Rebuild all internal data groups for routes as we process each
 	svcFwdRulesMap := NewServiceFwdRuleMap()
 
@@ -1451,6 +1834,11 @@ func (appMgr *Manager) syncRoutes(
 		if route.ObjectMeta.Namespace != sKey.Namespace {
 			continue
 		}
+
+		// Mark each resource as it is already processed during init Time
+		// So that later the create event of the same resource will not processed, unnecessarily
+		appMgr.processedResources[prepareResourceKey(Routes, sKey.Namespace, route.Name)] = true
+
 		key := route.Spec.Host + route.Spec.Path
 		if host, ok := routePathMap[key]; ok {
 			if host == route.Spec.Host {
@@ -1712,6 +2100,7 @@ type portStruct struct {
 }
 
 // Return the required ports for Ingress VS (depending on sslRedirect/allowHttp vals)
+// TODO remove the function once v1beta1.Ingress is deprecated in k8s 1.22
 func (appMgr *Manager) virtualPorts(ing *v1beta1.Ingress) []portStruct {
 	var httpPort int32
 	var httpsPort int32
@@ -1786,6 +2175,179 @@ func serviceMatch(svcs []string, sKey serviceQueueKey) bool {
 }
 
 // Common handling function for ConfigMaps, Ingresses, and Routes
+func (appMgr *Manager) handleConfigForTypeIngress(
+	rsCfg *ResourceConfig,
+	sKey serviceQueueKey,
+	rsMap ResourceMap,
+	rsName string,
+	svcPortMap map[int32]bool,
+	svc *v1.Service,
+	appInf *appInformer,
+	currResourceSvcs []string, // Used for Ingress/Routes
+	obj interface{}, // Used for writing events
+) (bool, int, int) {
+	vsFound := 0
+	vsUpdated := 0
+	var pool Pool
+	plIdx := 0
+	for j, backendSvc := range currResourceSvcs {
+		//get current resource skey and port
+		svcBackend := sKey.Namespace + "/" + backendSvc
+		//backend svc key of ingress
+		CurrsvcKey := serviceQueueKey{
+			ServiceName: backendSvc,
+			Namespace:   sKey.Namespace,
+		}
+		backend, _, _ := appInf.svcInformer.GetIndexer().GetByKey(svcBackend)
+		deactivated := false
+		found := false
+		// Get the pool that matches the sKey we are processing
+		for i, pl := range rsCfg.Pools {
+			if pl.ServiceName == CurrsvcKey.ServiceName &&
+				poolInNamespace(rsCfg, pl.Name, sKey.Namespace) {
+				pool = pl
+				plIdx = i
+				found = true
+				break
+			}
+		}
+		if !found {
+			//For multi-service continue processing remaining services.
+			if j < len(currResourceSvcs)-1 {
+				continue
+			}
+			return false, vsFound, vsUpdated
+		}
+		// Make sure pool members from the old config are applied to the new
+		// config pools.
+		appMgr.syncPoolMembers(rsName, rsCfg)
+
+		svcKey := ServiceKey{
+			Namespace:   sKey.Namespace,
+			ServiceName: pool.ServiceName,
+			ServicePort: pool.ServicePort,
+		}
+		if nil != backend {
+			svc := backend.(*v1.Service)
+			svcPortMap := make(map[int32]bool)
+			for _, portSpec := range svc.Spec.Ports {
+				svcPortMap[portSpec.Port] = false
+			}
+			// Match, remove config from rsMap so we don't delete it at the end.
+			// (rsMap contains configs we want to delete).
+			// In the case of Ingress/Routes: If the svc(s) of the currently processed ingress/route
+			// doesn't match the svc in our ServiceKey, then we don't want to remove the config from the map.
+			// Multiple Ingress/Routes can share a config, so if one Ingress/Route is deleted, then just
+			// the pools for that resource should be deleted from our config. By keeping the config in the map,
+			// we delete the necessary pools later on, while leaving everything else intact.
+			cfgList := rsMap[pool.ServicePort]
+			if serviceMatch(currResourceSvcs, sKey) {
+				if len(cfgList) == 1 && cfgList[0].GetName() == rsName {
+					delete(rsMap, pool.ServicePort)
+				} else if len(cfgList) > 1 {
+					for index, val := range cfgList {
+						if val.GetName() == rsName {
+							cfgList = append(cfgList[:index], cfgList[index+1:]...)
+						}
+					}
+					rsMap[pool.ServicePort] = cfgList
+				}
+			}
+
+			bigIPPrometheus.MonitoredServices.WithLabelValues(sKey.Namespace, rsName, "port-not-found").Set(0)
+			if _, ok := svcPortMap[pool.ServicePort]; !ok {
+				log.Debugf("[CORE] Process Service delete - name: %v namespace: %v",
+					pool.ServiceName, svcKey.Namespace)
+				log.Infof("[CORE] Port '%v' for service '%v' was not found.",
+					pool.ServicePort, pool.ServiceName)
+				bigIPPrometheus.MonitoredServices.WithLabelValues(sKey.Namespace, rsName, "port-not-found").Set(1)
+				bigIPPrometheus.MonitoredServices.WithLabelValues(sKey.Namespace, rsName, "success").Set(0)
+				if appMgr.deactivateVirtualServer(svcKey, rsName, rsCfg, plIdx) {
+					vsUpdated += 1
+				}
+				deactivated = true
+			}
+
+			bigIPPrometheus.MonitoredServices.WithLabelValues(sKey.Namespace, rsName, "service-not-found").Set(0)
+
+			// Update pool members.
+			vsFound += 1
+			correctBackend := true
+			var reason string
+			var msg string
+
+			if svc.ObjectMeta.Labels["component"] == "apiserver" && svc.ObjectMeta.Labels["provider"] == "kubernetes" {
+				appMgr.exposeKubernetesService(svc, svcKey, rsCfg, appInf, plIdx)
+			} else {
+				if appMgr.IsNodePort() {
+					correctBackend, reason, msg =
+						appMgr.updatePoolMembersForNodePort(svc, svcKey, rsCfg, plIdx)
+				} else {
+					correctBackend, reason, msg =
+						appMgr.updatePoolMembersForCluster(svc, svcKey, rsCfg, appInf, plIdx)
+				}
+			}
+			// This will only update the config if the vs actually changed.
+			if appMgr.saveVirtualServer(svcKey, rsName, rsCfg) {
+				vsUpdated += 1
+
+				// If this is an Ingress resource, add an event if there was a backend error
+				if !correctBackend {
+					if obj != nil {
+						switch obj.(type) {
+						case *v1beta1.Ingress:
+							appMgr.recordIngressEvent(obj.(*v1beta1.Ingress), reason, msg)
+						default:
+							appMgr.recordV1IngressEvent(obj.(*netv1.Ingress), reason, msg)
+
+						}
+					}
+				}
+			}
+
+			if !deactivated {
+				bigIPPrometheus.MonitoredServices.WithLabelValues(sKey.Namespace, rsName, "success").Set(1)
+			}
+		} else {
+			// The service is gone, de-activate it in the config.
+			log.Infof("[CORE] Service '%v' has not been found.", pool.ServiceName)
+			bigIPPrometheus.MonitoredServices.WithLabelValues(sKey.Namespace, rsName, "service-not-found").Set(1)
+			bigIPPrometheus.MonitoredServices.WithLabelValues(sKey.Namespace, rsName, "success").Set(0)
+			if !deactivated {
+				deactivated = true
+				if appMgr.deactivateVirtualServer(svcKey, rsName, rsCfg, plIdx) {
+					vsUpdated += 1
+				}
+			}
+			// If this is an Ingress resource, add an event that the service wasn't found
+			if obj != nil {
+				msg := fmt.Sprintf("Service '%v' has not been found.",
+					pool.ServiceName)
+				switch obj.(type) {
+				case *v1beta1.Ingress:
+					appMgr.recordIngressEvent(obj.(*v1beta1.Ingress), "ServiceNotFound", msg)
+				default:
+					appMgr.recordV1IngressEvent(obj.(*netv1.Ingress), "ServiceNotFound", msg)
+
+				}
+			}
+			//Continue processing other services for multi-svc backend
+			if j < len(currResourceSvcs)-1 {
+				continue
+			}
+			return false, vsFound, vsUpdated
+		}
+		if vsUpdated > 0 && !appMgr.processAllMultiSvc(len(rsCfg.Pools),
+			rsCfg.GetName()) {
+			vsUpdated -= 1
+			vsFound -= 1
+		}
+	}
+
+	return true, vsFound, vsUpdated
+}
+
+// Common handling function for ConfigMaps, Ingresses, and Routes
 func (appMgr *Manager) handleConfigForType(
 	rsCfg *ResourceConfig,
 	sKey serviceQueueKey,
@@ -1795,7 +2357,7 @@ func (appMgr *Manager) handleConfigForType(
 	svc *v1.Service,
 	appInf *appInformer,
 	currResourceSvcs []string, // Used for Ingress/Routes
-	ing *v1beta1.Ingress, // Used for writing events
+	obj interface{}, // Used for writing events
 ) (bool, int, int) {
 	vsFound := 0
 	vsUpdated := 0
@@ -1879,10 +2441,16 @@ func (appMgr *Manager) handleConfigForType(
 		}
 
 		// If this is an Ingress resource, add an event that the service wasn't found
-		if ing != nil {
+		if obj != nil {
 			msg := fmt.Sprintf("Service '%v' has not been found.",
 				pool.ServiceName)
-			appMgr.recordIngressEvent(ing, "ServiceNotFound", msg)
+			switch obj.(type) {
+			case *v1beta1.Ingress:
+				appMgr.recordIngressEvent(obj.(*v1beta1.Ingress), "ServiceNotFound", msg)
+			default:
+				appMgr.recordV1IngressEvent(obj.(*netv1.Ingress), "ServiceNotFound", msg)
+
+			}
 		}
 		return false, vsFound, vsUpdated
 	}
@@ -1911,8 +2479,14 @@ func (appMgr *Manager) handleConfigForType(
 
 		// If this is an Ingress resource, add an event if there was a backend error
 		if !correctBackend {
-			if ing != nil {
-				appMgr.recordIngressEvent(ing, reason, msg)
+			if obj != nil {
+				switch obj.(type) {
+				case *v1beta1.Ingress:
+					appMgr.recordIngressEvent(obj.(*v1beta1.Ingress), reason, msg)
+				default:
+					appMgr.recordV1IngressEvent(obj.(*netv1.Ingress), reason, msg)
+
+				}
 			}
 		}
 	}
@@ -1964,7 +2538,7 @@ func (appMgr *Manager) updatePoolMembersForNodePort(
 		}
 		//check if endpoints are found
 		if rsCfg.Pools[index].Members == nil {
-			log.Errorf("[CORE]Endpoints could not be fetched for service %v with port %v", svcKey.ServiceName, svcKey.ServicePort)
+			log.Debugf("[CORE]Endpoints could not be fetched for service %v with port %v", svcKey.ServiceName, svcKey.ServicePort)
 		}
 		return true, "", ""
 	} else {
@@ -1992,7 +2566,7 @@ func (appMgr *Manager) updatePoolMembersForCluster(
 	eps, _ := item.(*v1.Endpoints)
 	for _, portSpec := range svc.Spec.Ports {
 		if portSpec.Port == sKey.ServicePort {
-			ipPorts := appMgr.getEndpointsForCluster(portSpec.Name, eps)
+			ipPorts := appMgr.getEndpointsForCluster(portSpec.Name, eps, svc.Spec.ClusterIP)
 			log.Debugf("[CORE] Found endpoints for backend %+v: %v", sKey, ipPorts)
 			rsCfg.MetaData.Active = true
 			rsCfg.Pools[index].Members = ipPorts
@@ -2000,7 +2574,7 @@ func (appMgr *Manager) updatePoolMembersForCluster(
 	}
 	//check if endpoints are found
 	if rsCfg.Pools[index].Members == nil {
-		log.Errorf("[CORE]Endpoints could not be fetched for service %v with port %v", sKey.ServiceName, sKey.ServicePort)
+		log.Debugf("[CORE]Endpoints could not be fetched for service %v with port %v", sKey.ServiceName, sKey.ServicePort)
 	}
 	return true, "", ""
 }
@@ -2064,7 +2638,7 @@ func (appMgr *Manager) saveVirtualServer(
 			// not changed, don't trigger a config write
 			return false
 		}
-		log.Warningf("[CORE] Overwriting existing entry for backend %+v and resource %+v", sKey, rsName)
+		log.Debugf("[CORE] Overwriting existing entry for backend %+v and resource %+v", sKey, rsName)
 	}
 	appMgr.resources.Assign(sKey, rsName, newRsCfg)
 	return true
@@ -2176,7 +2750,7 @@ func (appMgr *Manager) setBindAddrAnnotation(
 	if doUpdate {
 		cm.ObjectMeta.Annotations[VsStatusBindAddrAnnotation] =
 			rsCfg.Virtual.VirtualAddress.BindAddr
-		_, err := appMgr.kubeClient.CoreV1().ConfigMaps(sKey.Namespace).Update(cm)
+		_, err := appMgr.kubeClient.CoreV1().ConfigMaps(sKey.Namespace).Update(context.TODO(), cm, metav1.UpdateOptions{})
 		if nil != err {
 			log.Warningf("[CORE] Error when creating status IP annotation: %s", err)
 		} else {
@@ -2187,9 +2761,11 @@ func (appMgr *Manager) setBindAddrAnnotation(
 	}
 }
 
+// TODO remove the function once v1beta1.Ingress is deprecated in k8s 1.22
 func (appMgr *Manager) setIngressStatus(
 	ing *v1beta1.Ingress,
 	rsCfg *ResourceConfig,
+	appInf *appInformer,
 ) {
 	// Set the ingress status to include the virtual IP
 	ip, _ := Split_ip_with_route_domain(rsCfg.Virtual.VirtualAddress.BindAddr)
@@ -2198,24 +2774,34 @@ func (appMgr *Manager) setIngressStatus(
 		ing.Status.LoadBalancer.Ingress = append(ing.Status.LoadBalancer.Ingress, lbIngress)
 	} else if ing.Status.LoadBalancer.Ingress[0].IP != ip {
 		ing.Status.LoadBalancer.Ingress[0] = lbIngress
+	} else {
+		return
 	}
-	_, updateErr := appMgr.kubeClient.ExtensionsV1beta1().
-		Ingresses(ing.ObjectMeta.Namespace).UpdateStatus(ing)
-	if nil != updateErr {
-		// Multi-service causes the controller to try to update the status multiple times
-		// at once. Ignore this error.
-		if strings.Contains(updateErr.Error(), "object has been modified") {
-			return
+	go appMgr.updateIngressStatus(ing, rsCfg, appInf)
+}
+func (appMgr *Manager) updateIngressStatus(ing *v1beta1.Ingress, rsCfg *ResourceConfig, appInf *appInformer) {
+	ingKey := ing.Namespace + "/" + ing.Name
+	_, ingFound, _ := appInf.ingInformer.GetIndexer().GetByKey(ingKey)
+	if ingFound {
+		_, updateErr := appMgr.kubeClient.ExtensionsV1beta1().
+			Ingresses(ing.ObjectMeta.Namespace).UpdateStatus(context.TODO(), ing, metav1.UpdateOptions{})
+		if nil != updateErr {
+			// Multi-service causes the controller to try to update the status multiple times
+			// at once. Ignore this error.
+			if strings.Contains(updateErr.Error(), "object has been modified") {
+				return
+			}
+			warning := fmt.Sprintf(
+				"Error when setting Ingress status IP for virtual server %v: %v",
+				rsCfg.GetName(), updateErr)
+			log.Warning(warning)
+			appMgr.recordIngressEvent(ing, "StatusIPError", warning)
 		}
-		warning := fmt.Sprintf(
-			"Error when setting Ingress status IP for virtual server %v: %v",
-			rsCfg.GetName(), updateErr)
-		log.Warning(warning)
-		appMgr.recordIngressEvent(ing, "StatusIPError", warning)
 	}
 }
 
 // Resolve the first host name in an Ingress and use the IP address as the VS address
+// TODO remove the function once v1beta1.Ingress is deprecated in k8s 1.22
 func (appMgr *Manager) resolveIngressHost(ing *v1beta1.Ingress, namespace string) {
 	var host, ipAddress string
 	var err error
@@ -2297,7 +2883,7 @@ func (appMgr *Manager) resolveIngressHost(ing *v1beta1.Ingress, namespace string
 		ing.ObjectMeta.Annotations = make(map[string]string)
 	}
 	ing.ObjectMeta.Annotations[F5VsBindAddrAnnotation] = ipAddress
-	_, err = appMgr.kubeClient.ExtensionsV1beta1().Ingresses(namespace).Update(ing)
+	_, err = appMgr.kubeClient.ExtensionsV1beta1().Ingresses(namespace).Update(context.TODO(), ing, metav1.UpdateOptions{})
 	if nil != err {
 		msg := fmt.Sprintf("Error while setting virtual-server IP for Ingress '%s': %s",
 			ing.ObjectMeta.Name, err)
@@ -2314,6 +2900,7 @@ func (appMgr *Manager) resolveIngressHost(ing *v1beta1.Ingress, namespace string
 func (appMgr *Manager) getEndpointsForCluster(
 	portName string,
 	eps *v1.Endpoints,
+	clusterIP string,
 ) []Member {
 	nodes := appMgr.getNodesFromCache()
 	var members []Member
@@ -2322,11 +2909,16 @@ func (appMgr *Manager) getEndpointsForCluster(
 		return members
 	}
 
+	// Mark each resource as it is already processed
+	// So that later the create event of the same resource will not processed, unnecessarily
+	appMgr.processedResources[prepareResourceKey(Endpoints, eps.Namespace, eps.Name)] = true
+
 	for _, subset := range eps.Subsets {
 		for _, p := range subset.Ports {
 			if portName == p.Name {
 				for _, addr := range subset.Addresses {
-					if containsNode(nodes, *addr.NodeName) {
+					// Checking for headless service
+					if containsNode(nodes, *addr.NodeName) || clusterIP == "None" {
 						member := Member{
 							Address: addr.IP,
 							Port:    p.Port,
@@ -2386,7 +2978,7 @@ func handleConfigMapParseFailure(
 		if _, ok := appMgr.resources.Get(sKey, rsName); ok {
 			appMgr.resources.Delete(sKey, rsName)
 			delete(cm.ObjectMeta.Annotations, VsStatusBindAddrAnnotation)
-			appMgr.kubeClient.CoreV1().ConfigMaps(cm.ObjectMeta.Namespace).Update(cm)
+			appMgr.kubeClient.CoreV1().ConfigMaps(cm.ObjectMeta.Namespace).Update(context.TODO(), cm, metav1.UpdateOptions{})
 			log.Warningf("[CORE] Deleted virtual server associated with ConfigMap: %v",
 				cm.ObjectMeta.Name)
 			return true
@@ -2540,7 +3132,13 @@ func (m *Manager) getEndpoints(selector, namespace string) []Member {
 	}
 
 	// Identify services that matches the given label
-	services, err := m.kubeClient.CoreV1().Services(namespace).List(svcListOptions)
+	var services *v1.ServiceList
+	var err error
+	if m.hubMode {
+		services, err = m.kubeClient.CoreV1().Services(v1.NamespaceAll).List(context.TODO(), svcListOptions)
+	} else {
+		services, err = m.kubeClient.CoreV1().Services(namespace).List(context.TODO(), svcListOptions)
+	}
 
 	if err != nil {
 		log.Errorf("[CORE] Error getting service list. %v", err)
@@ -2562,7 +3160,7 @@ func (m *Manager) getEndpoints(selector, namespace string) []Member {
 
 	for _, service := range services.Items {
 		if m.isNodePort == false { // Controller is in ClusterIP Mode
-			endpointsList, err := m.kubeClient.CoreV1().Endpoints(service.Namespace).List(
+			endpointsList, err := m.kubeClient.CoreV1().Endpoints(service.Namespace).List(context.TODO(),
 				metav1.ListOptions{
 					FieldSelector: "metadata.name=" + service.Name,
 				},
@@ -2638,4 +3236,52 @@ func (appMgr *Manager) exposeKubernetesService(
 		}
 	}
 	return true, "", ""
+}
+
+func prepareResourceKey(kind, namespace, name string) string {
+	return kind + "_" + namespace + "/" + name
+}
+
+func getIngressBackend(ing *v1beta1.Ingress) []string {
+	// Collect all service names on this Ingress.
+	// Used in handleConfigForType.
+	services := make(map[string]bool)
+	if nil != ing.Spec.Rules { // multi-service
+		for _, rl := range ing.Spec.Rules {
+			if nil != rl.IngressRuleValue.HTTP {
+				for _, pth := range rl.IngressRuleValue.HTTP.Paths {
+					services[pth.Backend.ServiceName] = true
+				}
+			}
+		}
+	} else { // single-service
+		services[ing.Spec.Backend.ServiceName] = true
+	}
+	//unique svc list
+	svcs := []string{}
+	for key, _ := range services {
+		svcs = append(svcs, key)
+	}
+	return svcs
+}
+
+func getIngressV1Backend(ing *netv1.Ingress) []string {
+	services := make(map[string]bool)
+	if nil != ing.Spec.Rules { // multi-service
+		for _, rl := range ing.Spec.Rules {
+			if nil != rl.IngressRuleValue.HTTP {
+				for _, pth := range rl.IngressRuleValue.HTTP.Paths {
+					services[pth.Backend.Service.Name] = true
+				}
+			}
+		}
+	} else { // single-service
+		services[ing.Spec.DefaultBackend.Service.Name] = true
+	}
+	//unique svc list
+	svcs := []string{}
+	for key, _ := range services {
+		svcs = append(svcs, key)
+	}
+	return svcs
 }

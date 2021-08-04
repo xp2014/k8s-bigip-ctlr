@@ -24,6 +24,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/F5Networks/k8s-bigip-ctlr/pkg/resource"
+
 	cisapiv1 "github.com/F5Networks/k8s-bigip-ctlr/config/apis/cis/v1"
 	log "github.com/F5Networks/k8s-bigip-ctlr/pkg/vlogger"
 )
@@ -300,7 +302,7 @@ func getRewriteActions(path, rwPath string, actionNameIndex int) ([]*action, err
 				Path:    path,
 				Replace: true,
 				Request: true,
-				Value:   rwPath,
+				Value:   resource.ParseRewriteAction(path, rwPath),
 			})
 		} else {
 			actions = append(actions, &action{

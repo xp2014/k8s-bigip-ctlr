@@ -17,9 +17,12 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+
+	"github.com/F5Networks/k8s-bigip-ctlr/pkg/teem"
 
 	"github.com/F5Networks/k8s-bigip-ctlr/pkg/crmanager"
 	"github.com/F5Networks/k8s-bigip-ctlr/pkg/health"
@@ -93,6 +96,12 @@ type (
 	}
 )
 
+const (
+	versionPathOpenshiftv3 = "/version/openshift"
+	versionPathOpenshiftv4 = "/apis/config.openshift.io/v1/clusterversions/version"
+	versionPathk8s         = "/version"
+)
+
 var (
 	// To be set by build
 	version   string
@@ -109,14 +118,17 @@ var (
 
 	// Custom Resource
 	customResourceMode *bool
+	defaultRouteDomain *int
 
 	pythonBaseDir    *string
 	logLevel         *string
 	verifyInterval   *int
 	nodePollInterval *int
+	syncInterval     *int
 	printVersion     *bool
 	httpAddress      *string
 	dgPath           string
+	disableTeems     *bool
 
 	namespaces             *[]string
 	useNodeInternal        *bool
@@ -127,6 +139,7 @@ var (
 	manageRoutes           *bool
 	manageConfigMaps       *bool
 	manageIngress          *bool
+	hubMode                *bool
 	nodeLabelSelector      *string
 	resolveIngNames        *string
 	defaultIngIP           *string
@@ -213,14 +226,19 @@ func _init() {
 		"Optional, interval (in seconds) at which to verify the BIG-IP configuration.")
 	nodePollInterval = globalFlags.Int("node-poll-interval", 30,
 		"Optional, interval (in seconds) at which to poll for cluster nodes.")
+	syncInterval = globalFlags.Int("periodic-sync-interval", 30,
+		"Optional, interval (in seconds) at which to queue resources.")
 	printVersion = globalFlags.Bool("version", false,
 		"Optional, print version and exit.")
 	httpAddress = globalFlags.String("http-listen-address", "0.0.0.0:8080",
 		"Optional, address to serve http based informations (/metrics and /health).")
-
+	disableTeems = globalFlags.Bool("disable-teems", false,
+		"Optional, flag to disable sending telemetry data to TEEM")
 	// Custom Resource
 	customResourceMode = globalFlags.Bool("custom-resource-mode", false,
 		"Optional, When set to true, controller processes only F5 Custom Resources.")
+	defaultRouteDomain = globalFlags.Int("default-route-domain", 0,
+		"Optional, CIS uses this value as default Route Domain in BIG-IP ")
 
 	globalFlags.Usage = func() {
 		fmt.Fprintf(os.Stderr, "  Global:\n%s\n", globalFlags.FlagUsagesWrapped(width))
@@ -293,6 +311,8 @@ func _init() {
 		"Optional, specify whether or not to manage Ingress resources")
 	manageConfigMaps = kubeFlags.Bool("manage-configmaps", true,
 		"Optional, specify whether or not to manage ConfigMap resources")
+	hubMode = kubeFlags.Bool("hubmode", false,
+		"Optional, specify whether or not to manage ConfigMap resources in hub-mode")
 	nodeLabelSelector = kubeFlags.String("node-label-selector", "",
 		"Optional, used to watch only for nodes with this label")
 	resolveIngNames = kubeFlags.String("resolve-ingress-names", "",
@@ -309,6 +329,7 @@ func _init() {
 		"Optional, enable/disable use of Secrets for Ingress or ConfigMap SSL Profiles.")
 	schemaLocal = kubeFlags.String("schema-db-base-dir", "file:///app/vendor/src/f5/schemas/",
 		"Optional, where the schema db's locally reside")
+	// TODO once ingress extentionv1/beta1 api is deprecated we can remove this deployment parameter
 	manageIngressClassOnly = kubeFlags.Bool("manage-ingress-class-only", false,
 		"Optional, default `false`. Process all ingress resources without `kubernetes.io/ingress.class`"+
 			"annotation and ingresses with annotation `kubernetes.io/ingress.class=f5`.")
@@ -490,6 +511,10 @@ func verifyArgs() error {
 		vxlanMode = "maintain"
 		vxlanName = *flannelName
 	}
+
+	if *hubMode && !(*manageConfigMaps) {
+		return fmt.Errorf("Hubmode is supported only for configmaps")
+	}
 	if *manageRoutes {
 		if len(*routeVserverAddr) == 0 {
 			return fmt.Errorf("Missing required parameter route-vserver-addr")
@@ -527,7 +552,7 @@ func getCredentials() error {
 					return fmt.Errorf(fmt.Sprintf("BIG-IP %s not specified", fieldType))
 				}
 			} else {
-				*field = string(fileBytes)
+				*field = strings.TrimSpace(string(fileBytes))
 			}
 			return nil
 		}
@@ -702,7 +727,17 @@ func setupWatchers(appMgr *appmanager.Manager, resyncPeriod time.Duration) {
 	label := resource.DefaultConfigMapLabel
 
 	if len(*namespaceLabel) == 0 {
-		ls, err := createLabel(label)
+		// For periodic monitoring
+		// Non monitoring namespaces will not be processed
+		ls, err := createLabel("")
+		if nil != err {
+			log.Warningf("[INIT] Failed to create label selector: %v", err)
+		}
+		err = appMgr.AddNamespaceLabelInformer(ls, resyncPeriod)
+		if nil != err {
+			log.Warningf("[INIT] Failed to add label watch for all namespaces:%v", err)
+		}
+		ls, err = createLabel(label)
 		if nil != err {
 			log.Warningf("[INIT] Failed to create label selector: %v", err)
 		}
@@ -717,7 +752,7 @@ func setupWatchers(appMgr *appmanager.Manager, resyncPeriod time.Duration) {
 				if nil != err {
 					log.Warningf("[INIT] Failed to add informers for namespace %v: %v", namespace, err)
 				} else {
-					log.Debugf("[INIT] Added informers for namespace %v: %v", namespace, err)
+					log.Debugf("[INIT] Added informers for namespace %v", namespace)
 				}
 			}
 		}
@@ -730,6 +765,7 @@ func setupWatchers(appMgr *appmanager.Manager, resyncPeriod time.Duration) {
 		if nil != err {
 			log.Warningf("[INIT] Failed to add label watch for all namespaces:%v", err)
 		}
+		appMgr.DynamicNS = true
 	}
 }
 
@@ -767,23 +803,41 @@ func initCustomResourceManager(
 
 	crMgr := crmanager.NewCRManager(
 		crmanager.Params{
-			Config:            config,
-			Namespaces:        *namespaces,
-			NamespaceLabel:    *namespaceLabel,
-			Partition:         (*bigIPPartitions)[0],
-			Agent:             agent,
-			ControllerMode:    *poolMemberType,
-			VXLANName:         vxlanName,
-			VXLANMode:         vxlanMode,
-			UseNodeInternal:   *useNodeInternal,
-			NodePollInterval:  *nodePollInterval,
-			NodeLabelSelector: *nodeLabelSelector,
-			IPAM:              *ipam,
-			ShareNodes:        *shareNodes,
+			Config:             config,
+			Namespaces:         *namespaces,
+			NamespaceLabel:     *namespaceLabel,
+			Partition:          (*bigIPPartitions)[0],
+			Agent:              agent,
+			ControllerMode:     *poolMemberType,
+			VXLANName:          vxlanName,
+			VXLANMode:          vxlanMode,
+			UseNodeInternal:    *useNodeInternal,
+			NodePollInterval:   *nodePollInterval,
+			NodeLabelSelector:  *nodeLabelSelector,
+			IPAM:               *ipam,
+			ShareNodes:         *shareNodes,
+			DefaultRouteDomain: *defaultRouteDomain,
 		},
 	)
 
 	return crMgr
+}
+
+// TODO Remove the function and appMgr.K8sVersion property once v1beta1.Ingress is deprecated in k8s 1.22
+// it is used to create informer for v1 ingress
+func getk8sVersion() string {
+	var versionInfo map[string]string
+	var err error
+	var vInfo []byte
+	rc := kubeClient.Discovery().RESTClient()
+	if vInfo, err = rc.Get().AbsPath(versionPathk8s).DoRaw(context.TODO()); err == nil {
+		// support k8s
+		if er := json.Unmarshal(vInfo, &versionInfo); er == nil {
+			// return fmt.Sprintf(versionInfo["gitVersion"])
+			return fmt.Sprintf(versionInfo["gitVersion"])
+		}
+	}
+	return ""
 }
 
 func main() {
@@ -856,10 +910,53 @@ func main() {
 		log.Fatalf("[INIT] error connecting to the client: %v", err)
 		os.Exit(1)
 	}
+	td := &teem.TeemsData{
+		CisVersion:      version,
+		Agent:           *agent,
+		PoolMemberType:  *poolMemberType,
+		PlatformInfo:    getUserAgentInfo(),
+		DateOfCISDeploy: time.Now().UTC().Format(time.RFC3339Nano),
+		AccessEnabled:   true,
+		ResourceType: teem.ResourceTypes{
+			Ingresses:       make(map[string]int),
+			Routes:          make(map[string]int),
+			Configmaps:      make(map[string]int),
+			VirtualServer:   make(map[string]int),
+			TransportServer: make(map[string]int),
+			ExternalDNS:     make(map[string]int),
+			IngressLink:     make(map[string]int),
+			IPAMVS:          make(map[string]int),
+			IPAMTS:          make(map[string]int),
+			IPAMSvcLB:       make(map[string]int),
+		},
+	}
+	if !(*disableTeems) {
+		if isNodePort {
+			td.SDNType = "nodeport-mode"
+		} else {
+			if len(*openshiftSDNName) > 0 {
+				td.SDNType = "openshiftSDN"
+			} else if len(*flannelName) > 0 {
+				td.SDNType = "flannel"
+			} else {
+				td.SDNType = "calico"
+			}
+		}
+
+		// Post telemetry data request
+		if !td.PostTeemsData() {
+			td.AccessEnabled = false
+			log.Errorf("Unable to post data to TEEM server. Restart CIS once firewall rules permit")
+		}
+	} else {
+		td.AccessEnabled = false
+		log.Debug("Telemetry data reporting to TEEM server is disabled")
+	}
 
 	if *customResourceMode {
 		getGTMCredentials()
 		crMgr := initCustomResourceManager(config)
+		crMgr.TeemData = td
 		err = crMgr.Agent.GetBigipAS3Version()
 		if err != nil {
 			log.Errorf("%v", err)
@@ -954,7 +1051,8 @@ func main() {
 	// Cleanup DEFAULT_PARTITION_AS3 partitions
 	//TODO: Remove this post CIS2.2
 	appMgr.AgentCIS.Remove(resource.DEFAULT_PARTITION)
-
+	appMgr.K8sVersion = getk8sVersion()
+	appMgr.TeemData = td
 	GetNamespaces(appMgr)
 	intervalFactor := time.Duration(*nodePollInterval)
 	np := pollers.NewNodePoller(appMgrParms.KubeClient, intervalFactor*time.Second, *nodeLabelSelector)
@@ -967,7 +1065,7 @@ func main() {
 	np.Run()
 	defer np.Stop()
 
-	setupWatchers(appMgr, 30*time.Second)
+	setupWatchers(appMgr, time.Duration(*syncInterval)*time.Second)
 	// Expose Prometheus metrics
 	http.Handle("/metrics", promhttp.Handler())
 	// Add health check e.g. is Python process still there?
@@ -1027,6 +1125,7 @@ func getAppManagerParams() appmanager.Params {
 		ManageConfigMaps:       *manageConfigMaps,
 		ManageIngress:          *manageIngress,
 		ManageIngressClassOnly: *manageIngressClassOnly,
+		HubMode:                *hubMode,
 		IngressClass:           *ingressClass,
 		TrustedCertsCfgmap:     *trustedCertsCfgmap,
 		DgPath:                 dgPath,
@@ -1126,7 +1225,7 @@ func getBIGIPTrustedCerts() string {
 }
 
 func getConfigMapUsingNamespaceAndName(cfgMapNamespace, cfgMapName string) (*v1.ConfigMap, error) {
-	cfgMap, err := kubeClient.CoreV1().ConfigMaps(cfgMapNamespace).Get(cfgMapName, metav1.GetOptions{})
+	cfgMap, err := kubeClient.CoreV1().ConfigMaps(cfgMapNamespace).Get(context.TODO(), cfgMapName, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -1171,21 +1270,16 @@ func getProcessAgentLabelFunc() func(map[string]string, string, string) bool {
 
 // Get platform info for TEEM
 func getUserAgentInfo() string {
-	const (
-		versionPathOpenshiftv3 = "/version/openshift"
-		versionPathOpenshiftv4 = "/apis/config.openshift.io/v1/clusterversions/version"
-		versionPathk8s         = "/version"
-	)
 	var versionInfo map[string]string
 	var err error
 	var vInfo []byte
 	rc := kubeClient.Discovery().RESTClient()
 	// support for ocp < 3.11
-	if vInfo, err = rc.Get().AbsPath(versionPathOpenshiftv3).DoRaw(); err == nil {
+	if vInfo, err = rc.Get().AbsPath(versionPathOpenshiftv3).DoRaw(context.TODO()); err == nil {
 		if err = json.Unmarshal(vInfo, &versionInfo); err == nil {
 			return fmt.Sprintf("CIS/v%v OCP/%v", version, versionInfo["gitVersion"])
 		}
-	} else if vInfo, err = rc.Get().AbsPath(versionPathOpenshiftv4).DoRaw(); err == nil {
+	} else if vInfo, err = rc.Get().AbsPath(versionPathOpenshiftv4).DoRaw(context.TODO()); err == nil {
 		// support ocp > 4.0
 		var ocp4 Ocp4Version
 		if er := json.Unmarshal(vInfo, &ocp4); er == nil {
@@ -1194,7 +1288,7 @@ func getUserAgentInfo() string {
 			}
 			return fmt.Sprintf("CIS/v%v OCP/v4.0.0", version)
 		}
-	} else if vInfo, err = rc.Get().AbsPath(versionPathk8s).DoRaw(); err == nil {
+	} else if vInfo, err = rc.Get().AbsPath(versionPathk8s).DoRaw(context.TODO()); err == nil {
 		// support k8s
 		if er := json.Unmarshal(vInfo, &versionInfo); er == nil {
 			return fmt.Sprintf("CIS/v%v K8S/%v", version, versionInfo["gitVersion"])

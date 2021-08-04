@@ -18,6 +18,9 @@ package crmanager
 
 import (
 	"fmt"
+	"net"
+	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -78,6 +81,9 @@ const (
 	// HTTP Events for LTM Policy
 	HTTPRequest    = "HTTPRequest"
 	TLSClientHello = "TLSClientHello"
+
+	LBServiceIPAMLabelAnnotation = "cis.f5.com/ipamLabel"
+	HealthMonitorAnnotation      = "cis.f5.com/health"
 )
 
 // NewCRManager creates a new CRManager Instance.
@@ -88,16 +94,16 @@ func NewCRManager(params Params) *CRManager {
 		crInformers: make(map[string]*CRInformer),
 		rscQueue: workqueue.NewNamedRateLimitingQueue(
 			workqueue.DefaultControllerRateLimiter(), "custom-resource-controller"),
-		resources:       NewResources(),
-		Agent:           params.Agent,
-		ControllerMode:  params.ControllerMode,
-		UseNodeInternal: params.UseNodeInternal,
-		initState:       true,
-		SSLContext:      make(map[string]*v1.Secret),
-		customProfiles:  NewCustomProfiles(),
-		dgPath:          strings.Join([]string{DEFAULT_PARTITION, "Shared"}, "/"),
-		shareNodes:      params.ShareNodes,
-		eventNotifier:   apm.NewEventNotifier(nil),
+		resources:          NewResources(),
+		Agent:              params.Agent,
+		ControllerMode:     params.ControllerMode,
+		UseNodeInternal:    params.UseNodeInternal,
+		initState:          true,
+		SSLContext:         make(map[string]*v1.Secret),
+		dgPath:             strings.Join([]string{DEFAULT_PARTITION, "Shared"}, "/"),
+		shareNodes:         params.ShareNodes,
+		eventNotifier:      apm.NewEventNotifier(nil),
+		defaultRouteDomain: params.DefaultRouteDomain,
 	}
 
 	log.Debug("Custom Resource Manager Created")
@@ -154,7 +160,7 @@ func NewCRManager(params Params) *CRManager {
 
 		crMgr.registerIPAMCRD()
 		time.Sleep(3 * time.Second)
-		crMgr.createIPAMResource()
+		_ = crMgr.createIPAMResource()
 	}
 
 	go crMgr.Start()
@@ -172,10 +178,45 @@ func (crMgr *CRManager) registerIPAMCRD() {
 //Create IPAM CRD
 func (crMgr *CRManager) createIPAMResource() error {
 
-	crName := ipamCRName + "." + DEFAULT_PARTITION
+	frameIPAMResourceName := func(bipUrl string) string {
+		re := regexp.MustCompile(`[A-Z][^A-Z]*`)
+		subStrs := re.FindAllString(DEFAULT_PARTITION, -1)
+		var prtn string
+		for _, elem := range subStrs {
+			lower := strings.ToLower(elem)
+			prtn += lower[:1] + "-" + lower[1:]
+		}
+
+		log.Debugf("BIP URL: %v", bipUrl)
+		if net.ParseIP(bipUrl) != nil {
+			return strings.Join([]string{ipamCRName, bipUrl, prtn}, ".")
+		}
+
+		u, err := url.Parse(bipUrl)
+		if err != nil {
+			log.Errorf("Unable to frame IPAM resource name in standard format")
+			return strings.Join([]string{ipamCRName, prtn}, ".")
+		}
+		var host string
+		if strings.Contains(u.Host, ":") {
+			host, _, _ = net.SplitHostPort(u.Host)
+		} else {
+			host = u.Host
+		}
+
+		if host == "" {
+			log.Errorf("Unable to frame IPAM resource name in standard format")
+			return strings.Join([]string{ipamCRName, prtn}, ".")
+		}
+
+		return strings.Join([]string{ipamCRName, host, prtn}, ".")
+	}
+
+	crName := frameIPAMResourceName(crMgr.Agent.BIGIPURL)
 	f5ipam := &ficV1.F5IPAM{
 		ObjectMeta: metaV1.ObjectMeta{
-			Name: crName,
+			Name:      crName,
+			Namespace: IPAMNamespace,
 		},
 		Spec: ficV1.F5IPAMSpec{
 			HostSpecs: make([]*ficV1.HostSpec, 0),
@@ -184,16 +225,42 @@ func (crMgr *CRManager) createIPAMResource() error {
 			IPStatus: make([]*ficV1.IPSpec, 0),
 		},
 	}
-
-	// f5ipam.SetResourceVersion(obj.ResourceVersion)
-	ipamCR, err := crMgr.ipamCli.Create(IPAMNamespace, f5ipam)
 	crMgr.ipamCR = IPAMNamespace + "/" + crName
-	if err != nil {
-		log.Debugf("[ipam] error while creating IPAM custom resource. %v", err)
-		return err
+
+	//Get all IPAMS
+	ipams, err := crMgr.ipamCli.List(IPAMNamespace)
+	if err == nil {
+		for _, ipam := range ipams {
+			err = crMgr.ipamCli.Delete(ipam.Namespace, ipam.Name, metaV1.DeleteOptions{})
+			if err != nil {
+				log.Debugf("[ipam] Delete failed. Error: %s", err.Error())
+			}
+		}
 	}
-	log.Debugf("[ipam] Created IPAM Custom Resource: \n%v\n", ipamCR)
-	return nil
+
+	ipamCR, err := crMgr.ipamCli.Create(f5ipam)
+	if err == nil {
+		log.Debugf("[ipam] Created IPAM Custom Resource: \n%v\n", ipamCR)
+		return nil
+	}
+
+	if strings.Contains(err.Error(), "already exists") {
+		err = crMgr.ipamCli.Delete(IPAMNamespace, crName, metaV1.DeleteOptions{})
+		if err != nil {
+			log.Debugf("[ipam] Delete failed. Error: %s", err.Error())
+		}
+
+		time.Sleep(3 * time.Second)
+
+		ipamCR, err = crMgr.ipamCli.Create(f5ipam)
+		if err == nil {
+			log.Debugf("[ipam] Created IPAM Custom Resource: \n%v\n", ipamCR)
+			return nil
+		}
+	}
+
+	log.Debugf("[ipam] error while creating IPAM custom resource. %v", err.Error())
+	return err
 }
 
 // createLabelSelector returns label used to identify F5 specific
@@ -242,9 +309,10 @@ func (crMgr *CRManager) setupClients(config *rest.Config) error {
 }
 
 func (crMgr *CRManager) setupInformers() error {
-	for n, _ := range crMgr.namespaces {
+	for n := range crMgr.namespaces {
 		if err := crMgr.addNamespacedInformer(n); err != nil {
 			log.Errorf("Unable to setup informer for namespace: %v, Error:%v", n, err)
+			return err
 		}
 	}
 	return nil

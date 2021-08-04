@@ -17,6 +17,8 @@
 package crmanager
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"reflect"
@@ -28,8 +30,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	cisapiv1 "github.com/F5Networks/k8s-bigip-ctlr/config/apis/cis/v1"
-	v1 "github.com/F5Networks/k8s-bigip-ctlr/config/apis/cis/v1"
 	log "github.com/F5Networks/k8s-bigip-ctlr/pkg/vlogger"
+	v1 "k8s.io/api/core/v1"
 )
 
 // NewResources is Constructor for Resources
@@ -439,10 +441,15 @@ func (crMgr *CRManager) prepareRSConfigFromVirtualServer(
 func (crMgr *CRManager) handleVirtualServerTLS(
 	rsCfg *ResourceConfig,
 	vs *cisapiv1.VirtualServer,
+	tls *cisapiv1.TLSProfile,
 	ip string,
 ) bool {
 	if 0 == len(vs.Spec.TLSProfileName) {
 		// Probably this is a non-tls Virtual Server, nothing to do w.r.t TLS
+		return false
+	}
+
+	if tls == nil {
 		return false
 	}
 
@@ -464,10 +471,6 @@ func (crMgr *CRManager) handleVirtualServerTLS(
 
 		// TLSProfile Object
 		tlsName := vs.Spec.TLSProfileName
-		tls := crMgr.getTLSProfileForVirtualServer(vs, vsNamespace)
-		if tls == nil {
-			return false
-		}
 
 		if tls.Spec.TLS.Termination == TLSPassthrough {
 			rsCfg.Virtual.PersistenceMethods = []string{"tls-session-id"}
@@ -516,17 +519,17 @@ func (crMgr *CRManager) handleVirtualServerTLS(
 					// Update the SSL Context if secret found, This is used to avoid api calls
 					log.Debugf("saving clientSSL secret for TLSProfile '%s' into SSLContext", tlsName)
 					secret, err := crMgr.kubeClient.CoreV1().Secrets(vsNamespace).
-						Get(clientSSL, metav1.GetOptions{})
+						Get(context.TODO(), clientSSL, metav1.GetOptions{})
 					if err != nil {
 						log.Errorf("secret %s not found for Virtual '%s' using TLSProfile '%s'",
 							clientSSL, vsName, tlsName)
 						return false
 					}
 					crMgr.SSLContext[clientSSL] = secret
-					error, _ := crMgr.createSecretClientSSLProfile(rsCfg, secret, CustomProfileClient)
-					if error != nil {
+					err, _ = crMgr.createSecretClientSSLProfile(rsCfg, secret, CustomProfileClient)
+					if err != nil {
 						log.Errorf("error %v encountered for '%s' using TLSProfile '%s'",
-							error, vsName, tlsName)
+							err, vsName, tlsName)
 						return false
 					}
 				}
@@ -548,17 +551,17 @@ func (crMgr *CRManager) handleVirtualServerTLS(
 					// Update the SSL Context if secret found, This is used to avoid api calls
 					log.Debugf("saving serverSSL secret for TLSProfile '%s' into SSLContext", tlsName)
 					secret, err := crMgr.kubeClient.CoreV1().Secrets(vsNamespace).
-						Get(serverSSL, metav1.GetOptions{})
+						Get(context.TODO(), serverSSL, metav1.GetOptions{})
 					if err != nil {
 						log.Errorf("secret %s not found for Virtual '%s' using TLSProfile '%s'",
 							serverSSL, vsName, tlsName)
 						return false
 					}
 					crMgr.SSLContext[serverSSL] = secret
-					error, _ := crMgr.createSecretServerSSLProfile(rsCfg, secret, CustomProfileServer)
-					if error != nil {
+					err, _ = crMgr.createSecretServerSSLProfile(rsCfg, secret, CustomProfileServer)
+					if err != nil {
 						log.Errorf("error %v encountered for '%s' using TLSProfile '%s'",
-							error, vsName, tlsName)
+							err, vsName, tlsName)
 						return false
 					}
 				}
@@ -1058,7 +1061,7 @@ func (crMgr *CRManager) handleDataGroupIRules(
 	rsCfg *ResourceConfig,
 	virtualName string,
 	vsHost string,
-	tls *v1.TLSProfile,
+	tls *cisapiv1.TLSProfile,
 ) {
 	// For https
 	if nil != tls {
@@ -1145,6 +1148,64 @@ func (crMgr *CRManager) prepareRSConfigFromTransportServer(
 
 	//set allowed VLAN's per TS config
 	rsCfg.Virtual.AllowVLANs = vs.Spec.AllowVLANs
+
+	// Attach user specified iRules
+	if len(vs.Spec.IRules) > 0 {
+		rsCfg.Virtual.IRules = append(rsCfg.Virtual.IRules, vs.Spec.IRules...)
+	}
+	return nil
+}
+
+// Prepares resource config based on VirtualServer resource config
+func (crMgr *CRManager) prepareRSConfigFromLBService(
+	rsCfg *ResourceConfig,
+	svc *v1.Service,
+	svcPort v1.ServicePort,
+) error {
+
+	poolName := formatVirtualServerPoolName(
+		svc.Namespace,
+		svc.Name,
+		svcPort.Port,
+		"")
+	pool := Pool{
+		Name:            poolName,
+		Partition:       rsCfg.Virtual.Partition,
+		ServiceName:     svc.Name,
+		ServicePort:     svcPort.Port,
+		NodeMemberLabel: "",
+	}
+
+	// Health Monitor Annotation
+	hmStr, found := svc.Annotations[HealthMonitorAnnotation]
+	var monitor Monitor
+	if found {
+		monitorType := strings.ToLower(string(svcPort.Protocol))
+		var mon ServiceTypeLBHealthMonitor
+		err := json.Unmarshal([]byte(hmStr), &mon)
+		if err != nil {
+			msg := fmt.Sprintf(
+				"Unable to parse health monitor JSON array '%v': %v", hmStr, err)
+			log.Errorf("[CORE] %s", msg)
+		}
+		pool.MonitorNames = append(pool.MonitorNames, JoinBigipPath(DEFAULT_PARTITION,
+			formatMonitorName(svc.Namespace, svc.Name, monitorType, svcPort.Port)))
+		monitor = Monitor{
+			Name:      formatMonitorName(svc.Namespace, svc.Name, monitorType, svcPort.Port),
+			Partition: rsCfg.Virtual.Partition,
+			Type:      monitorType,
+			Interval:  mon.Interval,
+			Send:      "",
+			Recv:      "",
+			Timeout:   mon.Timeout,
+		}
+		rsCfg.Monitors = append(rsCfg.Monitors, monitor)
+	}
+	rsCfg.Pools = Pools{pool}
+	rsCfg.Virtual.PoolName = poolName
+	rsCfg.Virtual.SNAT = DEFAULT_SNAT
+	rsCfg.Virtual.Mode = "standard"
+
 	return nil
 }
 

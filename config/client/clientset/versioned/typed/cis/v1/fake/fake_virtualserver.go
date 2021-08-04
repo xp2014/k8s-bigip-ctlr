@@ -19,6 +19,8 @@ limitations under the License.
 package fake
 
 import (
+	"context"
+
 	cisv1 "github.com/F5Networks/k8s-bigip-ctlr/config/apis/cis/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	labels "k8s.io/apimachinery/pkg/labels"
@@ -30,16 +32,16 @@ import (
 
 // FakeVirtualServers implements VirtualServerInterface
 type FakeVirtualServers struct {
-	Fake *FakeK8sV1
+	Fake *FakeCisV1
 	ns   string
 }
 
-var virtualserversResource = schema.GroupVersionResource{Group: "k8s.nginx.org", Version: "v1", Resource: "virtualservers"}
+var virtualserversResource = schema.GroupVersionResource{Group: "cis.f5.com", Version: "v1", Resource: "virtualservers"}
 
-var virtualserversKind = schema.GroupVersionKind{Group: "k8s.nginx.org", Version: "v1", Kind: "VirtualServer"}
+var virtualserversKind = schema.GroupVersionKind{Group: "cis.f5.com", Version: "v1", Kind: "VirtualServer"}
 
 // Get takes name of the virtualServer, and returns the corresponding virtualServer object, and an error if there is any.
-func (c *FakeVirtualServers) Get(name string, options v1.GetOptions) (result *cisv1.VirtualServer, err error) {
+func (c *FakeVirtualServers) Get(ctx context.Context, name string, options v1.GetOptions) (result *cisv1.VirtualServer, err error) {
 	obj, err := c.Fake.
 		Invokes(testing.NewGetAction(virtualserversResource, c.ns, name), &cisv1.VirtualServer{})
 
@@ -50,7 +52,7 @@ func (c *FakeVirtualServers) Get(name string, options v1.GetOptions) (result *ci
 }
 
 // List takes label and field selectors, and returns the list of VirtualServers that match those selectors.
-func (c *FakeVirtualServers) List(opts v1.ListOptions) (result *cisv1.VirtualServerList, err error) {
+func (c *FakeVirtualServers) List(ctx context.Context, opts v1.ListOptions) (result *cisv1.VirtualServerList, err error) {
 	obj, err := c.Fake.
 		Invokes(testing.NewListAction(virtualserversResource, virtualserversKind, c.ns, opts), &cisv1.VirtualServerList{})
 
@@ -72,14 +74,14 @@ func (c *FakeVirtualServers) List(opts v1.ListOptions) (result *cisv1.VirtualSer
 }
 
 // Watch returns a watch.Interface that watches the requested virtualServers.
-func (c *FakeVirtualServers) Watch(opts v1.ListOptions) (watch.Interface, error) {
+func (c *FakeVirtualServers) Watch(ctx context.Context, opts v1.ListOptions) (watch.Interface, error) {
 	return c.Fake.
 		InvokesWatch(testing.NewWatchAction(virtualserversResource, c.ns, opts))
 
 }
 
 // Create takes the representation of a virtualServer and creates it.  Returns the server's representation of the virtualServer, and an error, if there is any.
-func (c *FakeVirtualServers) Create(virtualServer *cisv1.VirtualServer) (result *cisv1.VirtualServer, err error) {
+func (c *FakeVirtualServers) Create(ctx context.Context, virtualServer *cisv1.VirtualServer, opts v1.CreateOptions) (result *cisv1.VirtualServer, err error) {
 	obj, err := c.Fake.
 		Invokes(testing.NewCreateAction(virtualserversResource, c.ns, virtualServer), &cisv1.VirtualServer{})
 
@@ -90,7 +92,7 @@ func (c *FakeVirtualServers) Create(virtualServer *cisv1.VirtualServer) (result 
 }
 
 // Update takes the representation of a virtualServer and updates it. Returns the server's representation of the virtualServer, and an error, if there is any.
-func (c *FakeVirtualServers) Update(virtualServer *cisv1.VirtualServer) (result *cisv1.VirtualServer, err error) {
+func (c *FakeVirtualServers) Update(ctx context.Context, virtualServer *cisv1.VirtualServer, opts v1.UpdateOptions) (result *cisv1.VirtualServer, err error) {
 	obj, err := c.Fake.
 		Invokes(testing.NewUpdateAction(virtualserversResource, c.ns, virtualServer), &cisv1.VirtualServer{})
 
@@ -100,8 +102,20 @@ func (c *FakeVirtualServers) Update(virtualServer *cisv1.VirtualServer) (result 
 	return obj.(*cisv1.VirtualServer), err
 }
 
+// UpdateStatus was generated because the type contains a Status member.
+// Add a +genclient:noStatus comment above the type to avoid generating UpdateStatus().
+func (c *FakeVirtualServers) UpdateStatus(ctx context.Context, virtualServer *cisv1.VirtualServer, opts v1.UpdateOptions) (*cisv1.VirtualServer, error) {
+	obj, err := c.Fake.
+		Invokes(testing.NewUpdateSubresourceAction(virtualserversResource, "status", c.ns, virtualServer), &cisv1.VirtualServer{})
+
+	if obj == nil {
+		return nil, err
+	}
+	return obj.(*cisv1.VirtualServer), err
+}
+
 // Delete takes name of the virtualServer and deletes it. Returns an error if one occurs.
-func (c *FakeVirtualServers) Delete(name string, options *v1.DeleteOptions) error {
+func (c *FakeVirtualServers) Delete(ctx context.Context, name string, opts v1.DeleteOptions) error {
 	_, err := c.Fake.
 		Invokes(testing.NewDeleteAction(virtualserversResource, c.ns, name), &cisv1.VirtualServer{})
 
@@ -109,15 +123,15 @@ func (c *FakeVirtualServers) Delete(name string, options *v1.DeleteOptions) erro
 }
 
 // DeleteCollection deletes a collection of objects.
-func (c *FakeVirtualServers) DeleteCollection(options *v1.DeleteOptions, listOptions v1.ListOptions) error {
-	action := testing.NewDeleteCollectionAction(virtualserversResource, c.ns, listOptions)
+func (c *FakeVirtualServers) DeleteCollection(ctx context.Context, opts v1.DeleteOptions, listOpts v1.ListOptions) error {
+	action := testing.NewDeleteCollectionAction(virtualserversResource, c.ns, listOpts)
 
 	_, err := c.Fake.Invokes(action, &cisv1.VirtualServerList{})
 	return err
 }
 
 // Patch applies the patch and returns the patched virtualServer.
-func (c *FakeVirtualServers) Patch(name string, pt types.PatchType, data []byte, subresources ...string) (result *cisv1.VirtualServer, err error) {
+func (c *FakeVirtualServers) Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts v1.PatchOptions, subresources ...string) (result *cisv1.VirtualServer, err error) {
 	obj, err := c.Fake.
 		Invokes(testing.NewPatchSubresourceAction(virtualserversResource, c.ns, name, pt, data, subresources...), &cisv1.VirtualServer{})
 
