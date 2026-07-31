@@ -1,28 +1,38 @@
-[![Build Status](https://dev.azure.com/f5networks/CIS/_apis/build/status/F5Networks.k8s-bigip-ctlr?branchName=refs%2Fpull%2F1886%2Fmerge)](https://dev.azure.com/f5networks/CIS/_build/latest?definitionId=6&branchName=refs%2Fpull%2F1886%2Fmerge)
 
-F5 Container Ingress Services for Kubernetes & OpenShift
+[![Build Status](https://dev.azure.com/f5networks/CIS/_apis/build/status/F5Networks.k8s-bigip-ctlr?branchName=master) ](https://dev.azure.com/f5networks/CIS/_build/latest?definitionId=6&branchName=master)
+[![Coverage Status](https://coveralls.io/repos/github/F5Networks/k8s-bigip-ctlr/badge.svg) ](https://coveralls.io/github/F5Networks/k8s-bigip-ctlr)
+
+***Effective April 2026, this repository will be archived and maintained for historical reference only. It will no longer receive active code development updates or monitoring.***
+
+If you have questions, feature requests, bug reports, or need assistance, please reach out to your F5 representative or contact the F5 Ingress Services product team at [f5-ingress-services-pm at f5 dot com](mailto:f5-ingress-services-pm@f5.com). When contacting us, please include your organization/company name and your contact information.
+
+The latest releases are available on [GitHub Releases](https://github.com/F5Networks/k8s-bigip-ctlr/releases), [Docker Hub](https://hub.docker.com/r/f5networks/k8s-bigip-ctlr), and the [Red Hat Container Registry](https://catalog.redhat.com/en/software/containers/f5networks/cntr-ingress-svcs/5ec7ad05ecb5246c0903f4cf). For more information on reporting issues and getting support, see the [Filing Issues and Getting Help](#filing-issues-and-getting-help) section.
+
+For CIS Helm charts and future updates, please use the actively maintained charts repository hosted on GitHub Pages: [F5Networks Charts (gh-pages branch)](https://github.com/F5Networks/charts/tree/gh-pages). Installation instructions, usage guidance, and other details are available in the official [CIS Helm Charts documentation](https://clouddocs.f5.com/containers/latest/userguide/kubernetes/#installing-cis-using-helm-charts).
+
+F5 BIG-IP Container Ingress Services for Kubernetes & OpenShift
 ========================================================
 
-The F5 Container Ingress Services for [Kubernetes](https://kubernetes.io/) and [OpenShift](https://www.openshift.com/) makes F5 [BIG-IP](https://www.f5.com/products/big-ip-services) services available to applications running in Kubernetes and OpenShift.
+The F5 BIG-IP Container Ingress Services for [Kubernetes](https://kubernetes.io/) and [OpenShift](https://www.openshift.com/) makes F5 [BIG-IP](https://www.f5.com/products/big-ip-services) services available to applications running in Kubernetes and OpenShift.
 
 Documentation
 -------------
 
 For instruction on how to use this component, see the
 [docs](https://clouddocs.f5.com/containers/latest/)
-for F5 Container Ingress Services for Kubernetes & OpenShift.
+for F5 BIG-IP Container Ingress Services for Kubernetes & OpenShift.
 
 For guides on this and other solutions for Kubernetes, see the
 [F5 Solution Guides for Kubernetes](https://clouddocs.f5.com/containers/latest/userguide/kubernetes/).
 
 What's New?
 -----------
-Support for Custom Resource Definitions [Documentation](https://github.com/F5Networks/k8s-bigip-ctlr/blob/master/docs/config_examples/crd/CustomResource.md)
+Support for Custom Resource Definitions [Documentation](./docs/config_examples/customResource/CustomResource.md)
 
 Getting Help
 ------------
 
-We encourage you to use the cis-kubernetes channel in our [f5CloudSolutions Slack workspace](https://f5cloudsolutions.herokuapp.com/) for discussion and assistance on this
+We encourage you to use the cis-kubernetes channel in our [f5CloudSolutions Slack workspace](https://f5cloudsolutions.slack.com/)  for discussion and assistance on this
 controller. This channel is typically monitored Monday-Friday 9am-5pm MST by F5
 employees who will offer best-effort support.
 
@@ -41,50 +51,7 @@ Usually, the controller is deployed in Kubernetes. However, the controller can b
 docker run f5networks/k8s-bigip-ctlr /app/bin/k8s-bigip-ctlr <args>
 ```
 
-
-Building
---------
-
-The official images are built using docker, but the adventurous can use standard go build tools.
-
-### Official Build
-
-Prerequisites:
-- Docker
-
-```shell
-git clone https://github.com/F5Networks/k8s-bigip-ctlr 
-cd  k8s-bigip-ctlr
-
-# Use docker to build the release artifacts, into a local "_docker_workspace" directory, then put into docker images
-# Debian image
-make prod
-
-OR
-
-# RHEL7 image
-make prod BASE_OS=rhel7
-```
-
-
-### Alternate, unofficial build
-
-A normal go toolchain can be used as well
-
-Prerequisites:
-- go 1.15
-- $GOPATH pointing at a valid go workspace
-- python
-- virtualenv
-
-```shell
-mkdir -p $GOPATH/src/github.com/F5Networks
-cd $GOPATH/src/github.com/F5Networks
-git clone https://github.com/f5networks/k8s-bigip-ctlr
-cd k8s-bigip-ctlr
-
-# Build all packages, and run unit tests
-make all test
-```
-
-To make changes to vendor dependencies, see [Devel](DEVEL.md)
+## Filing Issues and Getting Help
+If you encounter a bug or other issue while using F5 CIS, use [F5 Technical Support](https://www.f5.com/support) to submit it to our team.
+ 
+**Important**: As of April 2026, GitHub issues are no longer being monitored by F5 support staff.

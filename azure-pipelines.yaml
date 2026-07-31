@@ -22,8 +22,6 @@ variables:
   scanConnection: 'cis-scan-bot'
   quay_path: 'quay.io/f5networks/k8s-bigip-ctlr-devel'
   redhat_prj_name: 'cntr-ingress-svcs'
-  redhat_tag: '$(BUILD_VERSION)-rhel7'
-  docker_version: '$(BUILD_VERSION)'
   docker_repo: 'f5networks/k8s-bigip-ctlr'
   chartPath: 'incubator'
   chartRepoName: 'charts'
@@ -31,98 +29,74 @@ variables:
   helmVersion: 'v3.5.4'
   chartsUpdated: False
   operatorUpdated: False
+  docsUpdated: False
   operatorImageName: 'f5networks/f5-cis-operator-devel'
   operatorBundleImageName: 'f5networks/f5-cis-operator-bundle-devel'
   operatorIndexImage: 'f5networks/f5-cis-operator-index-devel'
+  goVersion: 1.23
 
 stages:
 - stage: PreCheck
+  dependsOn: []
   jobs:
-  - job: Preverification
+  - job: DocVerification
     steps:
-    - task: CmdLine@2
-      displayName: Check Go format and Suspicious constructs
-      inputs:
-        script: 'make verify'
-      continueOnError: true
-    - task: CmdLine@2
-      displayName: Check documentation
-      inputs:
-        script: 'make docs'
-- stage: ContainerImage
-  dependsOn: PreCheck
-  jobs:
-  - job: BuildContainerImage
-    steps:
-      - task: Docker@2
-        displayName: Login to redhat registry
-        inputs:
-          command: login
-          containerRegistry: $(redhatConnection)
-      - task: Docker@2
-        displayName: Login to quay registry
-        inputs:
-          command: login
-          containerRegistry: $(quayConnection)
-      - task: Docker@2
-        displayName: Login to docker registry
-        condition: startsWith(variables['build.sourceBranch'], 'refs/tags/')
-        inputs:
-          command: login
-          containerRegistry: $(dockerConnection)
-      - task: Docker@2
-        displayName: Login to scan registry
-        condition: startsWith(variables['build.sourceBranch'], 'refs/tags/')
-        inputs:
-          command: login
-          containerRegistry: $(scanConnection)
-      - task: Docker@2
-        displayName: Build from Red Hat Universal Base Image
-        inputs:
-          command: build
-          containerRegistry: $(quayConnection)
-          repository: $(imageName)
-          Dockerfile: build-tools/Dockerfile.ubi
-          buildContext: .
-          tags: $(Build.SourceVersion)
-          arguments: "--build-arg BUILD_INFO=azure-$(Build.BuildId)-$(Build.SourceVersion) --build-arg BUILD_VERSION=$(BUILD_VERSION) --build-arg RUN_TESTS=$(RUN_TESTS)"
-      - task: Docker@2
-        displayName: Push image to Quay
-        inputs:
-          command: push
-          containerRegistry: $(quayConnection)
-          repository: $(imageName)
-          tags: $(Build.SourceVersion)
       - script: |
-          set -ex
-          podman pull --authfile $(DOCKER_CONFIG)/config.json $(quay_path):$(Build.SourceVersion)
-          podman tag $(quay_path):$(Build.SourceVersion) scan.connect.redhat.com/$(REDHAT_PRJ_ID)/$(redhat_prj_name):$(redhat_tag)
-          podman push --authfile $(DOCKER_CONFIG)/config.json scan.connect.redhat.com/$(REDHAT_PRJ_ID)/$(redhat_prj_name):$(redhat_tag)
-        condition: and(succeeded(), startsWith(variables['build.sourceBranch'], 'refs/tags/'))
-        displayName: 'Push image to Redhat'
-        continueOnError: true
+          git diff HEAD HEAD~ --name-only | grep ".md\|.rst"
+          if  [ $? == 0 ] ; then echo "##vso[task.setvariable variable=docsUpdated]True"; fi
+        displayName: Check doc changes
+      # Set up Python
+      - task: UsePythonVersion@0
+        inputs:
+          versionSpec: '3.x'
+        displayName: 'Set up Python'
+        condition: and(succeeded(), or(startsWith(variables['build.sourceBranch'], 'refs/tags/'), eq(variables['docsUpdated'], 'True')) )
+      # Install Python dependencies
       - script: |
-          set -ex
-          docker pull $(quay_path):$(Build.SourceVersion)
-          docker tag $(quay_path):$(Build.SourceVersion) $(docker_repo):latest
-          docker tag $(quay_path):$(Build.SourceVersion) $(docker_repo):$(docker_version)
-          patch_version=`echo $(docker_version) | awk -F '.'  '{print $3}'`
-          if [ "${patch_version}" == "0" ] ; then
-            stripped_version=`echo $(docker_version) | rev | cut -c3- | rev`
-            docker tag $(quay_path):$(Build.SourceVersion) $(docker_repo):${stripped_version}
-            docker push $(docker_repo):${stripped_version}
+          echo "Installing Python packages..."
+          python -m pip install --upgrade pip
+          pip install sphinx f5-sphinx-theme sphinx-copybutton sphinxjp.themes.basicstrap cloud_sptheme myst-parser
+          pip install jinja2==3.0
+        displayName: 'Install Sphinx'
+        condition: and(succeeded(), or(startsWith(variables['build.sourceBranch'], 'refs/tags/'), eq(variables['docsUpdated'], 'True')) )
+
+        # Run Sphinx link checker with rate limiting
+      - script: |
+          echo "Identifying changed documentation files..."
+          CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD | grep -E '\.rst$|\.md$' || true)
+          if [ -z "$CHANGED_FILES" ]; then
+          echo "No documentation files have been modified in the current commit."
+          exit 0
           fi
-          docker push $(docker_repo):latest
-          docker push $(docker_repo):$(docker_version)
-        displayName: 'Push image to DockerHub'
-        condition: startsWith(variables['build.sourceBranch'], 'refs/tags/')
+          echo "Running linkcheck on modified files..."
+          sphinx-build -b linkcheck -E docs build/linkcheck $CHANGED_FILES
+        condition: and(succeeded(), or(startsWith(variables['build.sourceBranch'], 'refs/tags/'), eq(variables['docsUpdated'], 'True')) )
+        displayName: 'Run Sphinx Linkcheck'
+
+      # Install write-good
+      - script: |
+          echo "Installing write-good..."
+          sudo apt install -y nodejs
+          sudo npm install -g write-good
+        displayName: 'Install write-good'
+        condition: and(succeeded(), or(startsWith(variables['build.sourceBranch'], 'refs/tags/'), eq(variables['docsUpdated'], 'True')) )
+
+      # Run write-good
+      - script: |
+          echo "Checking grammar and style"
+          write-good `find docs -name '*.rst'` --passive --so --no-illusion --thereIs --cliches
+          write-good `find docs -name '*.md'` --so --no-illusion --thereIs --cliches
+        displayName: 'Run write-good checks'
+        condition: and(succeeded(), or(startsWith(variables['build.sourceBranch'], 'refs/tags/'), eq(variables['docsUpdated'], 'True')) )
+
 - stage: Charts
-  dependsOn: PreCheck
+  condition: false
+  dependsOn: []
   jobs:
   - job: BuildCharts
     steps:
     - script: |
-          git diff HEAD HEAD~ --name-only | grep "helm-charts/\|docs/config_examples/crd/Install/customresourcedefinitions.yml"
+          git diff HEAD HEAD~ --name-only | grep "helm-charts/\|docs/config_examples/rbac/clusterrole.yaml"
           if  [ $? == 0 ] ; then echo "##vso[task.setvariable variable=chartsUpdated]True"; fi
       displayName: Check Helm changes
     - script: echo '##vso[task.setvariable variable=chartPath]stable'
@@ -135,13 +109,22 @@ stages:
       displayName: Install Helm
       failOnStderr: true
       condition: and(succeeded(), or(startsWith(variables['build.sourceBranch'], 'refs/tags/'), eq(variables['chartsUpdated'], 'True')) )
+    - task: UsePythonVersion@0
+      displayName: Install Python
+      inputs:
+        versionSpec: '3.8'
+        addToPath: true
+        architecture: 'x64'
+      condition: and(succeeded(), or(startsWith(variables['build.sourceBranch'], 'refs/tags/'), eq(variables['chartsUpdated'], 'True')) )
     - script: |
         mkdir -p ./helm-charts/f5-bigip-ctlr/crds
-        cp ./docs/config_examples/crd/Install/customresourcedefinitions.yml ./helm-charts/f5-bigip-ctlr/crds/f5-bigip-ctlr-customresourcedefinitions.yml
-        cp ./helm-charts/f5-bigip-ctlr-ingress-class.yaml ./helm-charts/f5-bigip-ctlr/templates/f5-bigip-ctlr-ingress-class.yaml
+        cp ./docs/config_examples/customResourceDefinitions/customresourcedefinitions.yml ./helm-charts/f5-bigip-ctlr/crds/f5-bigip-ctlr-customresourcedefinitions.yml
         sed -i '/metadata:/r ./helm-charts/labels.txt' ./helm-charts/f5-bigip-ctlr/crds/f5-bigip-ctlr-customresourcedefinitions.yml
+        pip install --disable-pip-version-check -r ./build-tools/py-requirements.txt
+        python ./build-tools/helm-clusterrole-gen.py
         helm lint --strict ./helm-charts/f5-bigip-ctlr --set 'args.bigip_url=https://example.com'
         helm package ./helm-charts/f5-bigip-ctlr --destination .deploy/
+
       displayName: Package Helm Chart
       failOnStderr: true
       condition: and(succeeded(), or(startsWith(variables['build.sourceBranch'], 'refs/tags/'), eq(variables['chartsUpdated'], 'True')) )
@@ -150,17 +133,17 @@ stages:
         git clone --single-branch --branch gh-pages https://$(PAT)@github.com/$(chartOrganization)/$(chartRepoName).git /tmp/$(chartRepoName)
         cp -rf .deploy/*.tgz /tmp/$(chartRepoName)/$(chartPath)/
         pushd /tmp/$(chartRepoName)
-        git config user.email "v.lohiya@f5.com"
-        git config user.name "cisbotctlr"
+        git config user.email "cisctlrbot@f5.com"
+        git config user.name "cisctlrbot"
         helm repo index --url https://$(chartOrganization).github.io/$(chartRepoName)/$(chartPath) $(chartPath)
         git add --all
-        git commit -m 'Updating charts for CIS Release v$(BUILD_VERSION) and Build Info azure-$(Build.BuildId)-$(Build.SourceVersion) in $(chartPath)'
+        git commit -m 'Updating charts for CIS Release v$(cat next-version.txt) and Build Info azure-$(Build.BuildId)-$(Build.SourceVersion) in $(chartPath)'
         git push origin gh-pages
         popd
       displayName: Upload charts
       condition: and(succeeded(), or(startsWith(variables['build.sourceBranch'], 'refs/tags/'), eq(variables['chartsUpdated'], 'True')) )
 - stage: Operator
-  dependsOn: PreCheck
+  dependsOn: []
   jobs:
   - job: BuildOperator
     steps:
@@ -175,12 +158,30 @@ stages:
         command: login
         containerRegistry: $(quayConnection)
     - task: Docker@2
+      displayName: Login to redhat registry
+      condition: and(succeeded(), eq(variables['operatorUpdated'], 'True'))
+      inputs:
+        command: login
+        containerRegistry: $(redhatConnection)
+    - task: UsePythonVersion@0
+      displayName: Install Python
+      inputs:
+        versionSpec: '3.8'
+        addToPath: true
+        architecture: 'x64'
+      condition: and(succeeded(), eq(variables['operatorUpdated'], 'True'))
+    - script: |
+        pip install --disable-pip-version-check -r ./build-tools/py-requirements.txt
+        python ./build-tools/helm-clusterrole-gen.py
+      displayName: 'Generate the ClusterRole file'
+      condition: and(succeeded(), eq(variables['operatorUpdated'], 'True'))
+    - task: Docker@2
       displayName: Build Operator Image for test
       inputs:
         command: build
         containerRegistry: $(quayConnection)
         repository: $(operatorImageName)
-        Dockerfile: operator/build/Dockerfile
+        Dockerfile: f5-bigip-ctlr-operator/Dockerfile
         buildContext: .
         tags: $(Build.SourceVersion)
       condition: and(succeeded(), eq(variables['operatorUpdated'], 'True'))
@@ -193,9 +194,7 @@ stages:
         repository: $(operatorImageName)
         tags: $(Build.SourceVersion)
     - script: |
-        operatorVersion=$(ls -d  operator/manifest/new-f5-bundle/1.* | sort -Vr | head -1 | awk -F '/' '{print $4}')
-        sed -i 's|registry.connect.redhat.com/f5networks/k8s-bigip-ctlr-operator:latest|quay.io/$(operatorImageName):$(Build.SourceVersion)|g' ./operator/manifest/new-f5-bundle/${operatorVersion}/manifests/f5-bigip-ctlr-operator.v${operatorVersion}.clusterserviceversion.yaml
-        sed -i 's|registry.connect.redhat.com/f5networks/k8s-bigip-ctlr-operator:latest|quay.io/$(operatorImageName):$(Build.SourceVersion)|g' ./operator/manifest/new-f5-bundle/${operatorVersion}/manifests/f5-bigip-ctlr-operator.v${operatorVersion}.clusterserviceversion.yaml
+        sed -i 's|registry.connect.redhat.com/f5networks/k8s-bigip-ctlr-operator:latest|quay.io/$(operatorImageName):$(Build.SourceVersion)|g' ./f5-bigip-ctlr-operator/bundle/manifests/f5-bigip-ctlr-operator.clusterserviceversion.yaml
       displayName: 'Prepare the charts repo for bunding with operator'
       condition: and(succeeded(), eq(variables['operatorUpdated'], 'True'))
     - task: Docker@2
@@ -205,8 +204,8 @@ stages:
         command: build
         containerRegistry: $(quayConnection)
         repository: $(operatorBundleImageName)
-        Dockerfile: operator/manifest/new-f5-bundle/Dockerfile
-        buildContext: operator/manifest/new-f5-bundle
+        Dockerfile: f5-bigip-ctlr-operator/bundle.Dockerfile
+        buildContext: f5-bigip-ctlr-operator
         tags: $(Build.SourceVersion)
     - task: Docker@2
       displayName: Push Operator Bundle image to Quay for testing 
@@ -217,7 +216,7 @@ stages:
         repository: $(operatorBundleImageName)
         tags: $(Build.SourceVersion)
     - script: |
-        wget https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/latest-4.6/opm-linux.tar.gz
+        wget http://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/latest-4.9/opm-linux.tar.gz
         tar xvf opm-linux.tar.gz
         ./opm index add --bundles quay.io/$(operatorBundleImageName):$(Build.SourceVersion) --tag quay.io/$(operatorIndexImage):$(Build.SourceVersion) 
         podman push quay.io/$(operatorIndexImage):$(Build.SourceVersion)

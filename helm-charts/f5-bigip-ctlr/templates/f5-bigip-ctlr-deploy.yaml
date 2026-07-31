@@ -45,26 +45,31 @@ spec:
 {{- end }}
       securityContext:
         {{- $securityContext := .Values.securityContext | default dict }}
+        {{- $oscpOperator := .Files.Glob "oscp-operator.txt"  }}
         {{- if $securityContext.runAsUser }}
         runAsUser: {{ $securityContext.runAsUser }}
-        {{- else }}
-          runAsUser: 1000
+        {{- else if (not $oscpOperator) }}
+        runAsUser: 1000
         {{- end }}
         {{- $securityContext := .Values.securityContext | default dict }}
         {{- if $securityContext.runAsGroup }}
         runAsGroup: {{ $securityContext.runAsGroup }}
-        {{- else }}
-          runAsGroup: 1000
+        {{- else if (not $oscpOperator) }}
+        runAsGroup: 1000
         {{- end }}
         {{- $securityContext := .Values.securityContext | default dict }}
         {{- if $securityContext.fsGroup }}
         fsGroup: {{ $securityContext.fsGroup }}
-        {{- else }}
-          fsGroup: 1000
+        {{- else if (not $oscpOperator) }}
+        fsGroup: 1000
         {{- end }}
       containers:
       - name: {{ template "f5-bigip-ctlr.name" . }}
         image: "{{ .Values.image.user }}/{{ .Values.image.repo }}:{{ .Values.version }}"
+        {{- if .Values.podSecurityContext }}
+        securityContext:
+{{ toYaml .Values.podSecurityContext | indent 12 }}
+        {{- end }}
         livenessProbe:
           failureThreshold: 3
           httpGet:
@@ -72,7 +77,7 @@ spec:
             port: 8080
             scheme: HTTP
           initialDelaySeconds: 15
-          periodSeconds: 15
+          periodSeconds: 120
           successThreshold: 1
           timeoutSeconds: 15
         readinessProbe:
@@ -82,7 +87,7 @@ spec:
             port: 8080
             scheme: HTTP
           initialDelaySeconds: 30
-          periodSeconds: 30
+          periodSeconds: 120
           successThreshold: 1
           timeoutSeconds: 15
         volumeMounts:
@@ -93,6 +98,9 @@ spec:
         command:
         - /app/bin/k8s-bigip-ctlr
         args:
+{{- if .Values.ingressClass.ingressClassName }}
+        - --ingress-class={{ .Values.ingressClass.ingressClassName | default "f5" }}
+{{- end }}
         - --credentials-directory
         - /tmp/creds
         {{- $ns := .Values.args.namespaces }}
@@ -123,5 +131,9 @@ spec:
       volumes:
       - name: bigip-creds
         secret:
-           secretName: {{ .Values.bigip_login_secret }}
+      {{- if .Values.bigip_secret.create }}
+          secretName: f5-bigip-ctlr-login
+      {{- else }}
+          secretName: {{ .Values.bigip_login_secret }}
+      {{- end }}
 {{- end }}

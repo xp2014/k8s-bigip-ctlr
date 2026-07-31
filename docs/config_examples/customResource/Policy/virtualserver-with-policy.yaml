@@ -1,0 +1,28 @@
+# policyName can be used to attach profiles/policies defined in Policy CRD.
+# Set policyNamespace when the Policy CR is managed in another namespace.
+apiVersion: cis.f5.com/v1
+kind: VirtualServer
+metadata:
+  labels:
+    f5cr: "true"
+  name: cr-foo-with-policy
+  namespace: default
+spec:
+  host: foo.example.com
+  iRules: []
+  policyName: sample-policy
+  policyNamespace: f5-resources
+  pools:
+    - monitor:
+        interval: 13
+        recv: a
+        send: /
+        timeout: 10
+        type: http
+      path: /foo
+      service: svc-1
+      servicePort: 80
+  snat: auto
+  dos: /Common/dos
+  botDefense: /Common/bot-defense
+  virtualServerAddress: 10.1.2.3
